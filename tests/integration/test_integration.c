@@ -304,9 +304,7 @@ TEST(test_ipv6_loopback) {
     if (r != WN_OK) {
         /* IPv6 loopback may be unavailable in some sandboxed CI network
          * namespaces -- skip rather than fail the whole suite in that case. */
-        printf("  SKIP test_ipv6_loopback: server bind failed (%s) -- IPv6 may be unavailable here\n",
-               wn_error_string(r));
-        return;
+        SKIP_TEST("server bind failed -- IPv6 may be unavailable here");
     }
     wn_client_create(&cfg, &client);
 
@@ -338,10 +336,7 @@ TEST(test_discovery_over_real_sockets) {
     if (probe != WN_OK) {
         /* Broadcast (and loopback fallback) may both be unavailable in a
          * restricted namespace; skip rather than fail the whole suite. */
-        printf("  SKIP test_discovery_over_real_sockets: wn_discovery_probe failed (%d)\n", probe);
-        wn_endpoint_destroy(client);
-        wn_endpoint_destroy(server);
-        return;
+        SKIP_TEST("wn_discovery_probe failed");
     }
 
     wn_event_t ev;
@@ -350,11 +345,9 @@ TEST(test_discovery_over_real_sockets) {
         /* UDP broadcast can be filtered in some sandboxed network
          * namespaces even on loopback-adjacent setups; skip rather than
          * fail outright, but note it clearly. */
-        printf("  SKIP test_discovery_over_real_sockets: no broadcast reply received "
-               "(broadcast may be filtered in this network namespace)\n");
         wn_endpoint_destroy(client);
         wn_endpoint_destroy(server);
-        return;
+        SKIP_TEST("no broadcast reply received (broadcast may be filtered in this network namespace)");
     }
     ASSERT_TRUE(strcmp(ev.server_name, "Test Arena") == 0);
 
@@ -483,19 +476,16 @@ TEST(test_max_connections_clamped_to_internal_cap) {
     ASSERT_EQ(wn_discovery_enable(server, 34801), WN_OK);
     wn_result_t probe = wn_discovery_probe(client, 34801, 500);
     if (probe != WN_OK) {
-        printf("  SKIP clamp discovery assert: wn_discovery_probe failed (%d)\n", probe);
-        wn_endpoint_destroy(client);
-        wn_endpoint_destroy(server);
-        return;
+        SKIP_TEST("wn_discovery_probe failed");
     }
 
     wn_event_t ev;
     bool got = wait_for_event(client, WN_EVENT_DISCOVERY_REPLY, &ev, 3000);
-    if (got) {
+        if (got) {
         /* Advertised max must be the clamped 512, not 10000. */
         ASSERT_EQ(ev.server_max_players, 512u);
     } else {
-        printf("  SKIP clamp discovery assert: broadcast filtered in this namespace\n");
+        SKIP_TEST("broadcast filtered in this network namespace");
     }
 
     wn_endpoint_destroy(client);
@@ -525,10 +515,7 @@ TEST(test_server_name_copied_at_create_time) {
     ASSERT_EQ(wn_discovery_enable(server, 34802), WN_OK);
     wn_result_t probe = wn_discovery_probe(client, 34802, 500);
     if (probe != WN_OK) {
-        printf("  SKIP server_name discovery assert: wn_discovery_probe failed (%d)\n", probe);
-        wn_endpoint_destroy(client);
-        wn_endpoint_destroy(server);
-        return;
+        SKIP_TEST("wn_discovery_probe failed");
     }
 
     wn_event_t ev;
@@ -536,7 +523,7 @@ TEST(test_server_name_copied_at_create_time) {
     if (got) {
         ASSERT_TRUE(strcmp(ev.server_name, "Stable Name") == 0);
     } else {
-        printf("  SKIP server_name discovery assert: broadcast filtered in this namespace\n");
+        SKIP_TEST("broadcast filtered in this network namespace");
     }
 
     wn_endpoint_destroy(client);
@@ -570,10 +557,7 @@ TEST(test_discovery_wrong_nonce_ignored) {
     ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
     wn_result_t probe = wn_discovery_probe(client, 34804, 500);
     if (probe != WN_OK) {
-        printf("  SKIP test_discovery_wrong_nonce_ignored: wn_discovery_probe failed (%d)\n", probe);
-        close(raw);
-        wn_endpoint_destroy(client);
-        return;
+        SKIP_TEST("wn_discovery_probe failed");
     }
 
     /* Capture the outgoing DISCOVERY_REQUEST (loopback copy). */
@@ -582,10 +566,7 @@ TEST(test_discovery_wrong_nonce_ignored) {
     socklen_t from_len = sizeof(from);
     ssize_t n = recvfrom(raw, req, sizeof(req), 0, (struct sockaddr *)&from, &from_len);
     if (n < (ssize_t)WN_DISCOVERY_REQUEST_SIZE || req[0] != WN_PKT_DISCOVERY_REQUEST) {
-        printf("  SKIP test_discovery_wrong_nonce_ignored: no probe captured on loopback\n");
-        close(raw);
-        wn_endpoint_destroy(client);
-        return;
+        SKIP_TEST("no probe captured on loopback");
     }
     uint32_t real_nonce = wn_get_u32(req + 5);
     ASSERT_TRUE(real_nonce != 0); /* probes are never zero so 0 is a guaranteed-wrong nonce */
