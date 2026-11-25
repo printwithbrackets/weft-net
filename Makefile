@@ -111,6 +111,7 @@ test-unit: | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -pthread -o $(TEST_BIN_DIR)/test_connection src/connection.c src/channel.c src/seqbuf.c src/fragment.c src/crypto.c tests/test_connection.c $(CRYPTO_LIBS)
 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_network_simulation src/channel.c src/seqbuf.c src/fragment.c tests/test_network_simulation.c
 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_websocket src/websocket.c src/crypto.c tests/test_websocket.c $(CRYPTO_LIBS)
+	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_framework tests/test_framework.c
 	@echo "--- running unit tests ---"
 	$(TEST_BIN_DIR)/test_seqbuf
 	$(TEST_BIN_DIR)/test_crypto
@@ -119,6 +120,7 @@ test-unit: | $(BUILD_DIR)
 	$(TEST_BIN_DIR)/test_connection
 	$(TEST_BIN_DIR)/test_network_simulation
 	$(TEST_BIN_DIR)/test_websocket
+	$(TEST_BIN_DIR)/test_framework
 
 test-integration: | $(BUILD_DIR)
 	mkdir -p $(TEST_BIN_DIR)

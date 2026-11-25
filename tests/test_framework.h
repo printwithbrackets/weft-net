@@ -31,11 +31,21 @@
 
 static int wn_tests_run = 0;
 static int wn_tests_failed = 0;
+static int wn_tests_skipped = 0;
 static int wn_current_test_failed = 0;
+static int wn_current_test_skipped = 0;
 static const char *wn_current_test = NULL;
 #ifndef WN_TEST_NO_LONGJMP
 static jmp_buf wn_test_jmp;
 #endif
+
+/* Record the current test as skipped. Sets the per-test flag the RUN_TEST
+ * macro checks (so the outcome is reported as SKIP, not as OK and not as a
+ * failure), and bumps the skipped total that the final summary prints. */
+static inline void wn_mark_test_skipped(void) {
+    wn_tests_skipped++;
+    wn_current_test_skipped = 1;
+}
 
 #define TEST(name) static void name(void)
 #ifdef WN_TEST_NO_LONGJMP
@@ -44,10 +54,11 @@ static jmp_buf wn_test_jmp;
     wn_tests_run++; \
     int before = wn_tests_failed; \
     wn_current_test_failed = 0; \
+    wn_current_test_skipped = 0; \
     printf("  RUN  %s\n", #name); \
     fflush(stdout); \
     name(); /* a failure exits the process: see WN_FAIL_FATAL */ \
-    if (wn_tests_failed == before) printf("  OK   %s\n", #name); \
+    if (!wn_current_test_skipped && wn_tests_failed == before) printf("  OK   %s\n", #name); \
     fflush(stdout); \
 } while (0)
 #else
@@ -56,13 +67,25 @@ static jmp_buf wn_test_jmp;
     wn_tests_run++; \
     int before = wn_tests_failed; \
     wn_current_test_failed = 0; \
+    wn_current_test_skipped = 0; \
     printf("  RUN  %s\n", #name); \
     fflush(stdout); \
     if (setjmp(wn_test_jmp) == 0) name(); \
-    if (wn_tests_failed == before) printf("  OK   %s\n", #name); \
+    if (!wn_current_test_skipped && wn_tests_failed == before) printf("  OK   %s\n", #name); \
     fflush(stdout); \
 } while (0)
 #endif
+
+/* Skip the current test instead of failing it: the outcome is reported as
+ * SKIP with a reason, it never counts as failed, and it must not be counted
+ * as OK. Environment-dependent checks (no IPv6, no broadcast in this
+ * network namespace) take this path rather than failing the whole suite. */
+#define SKIP_TEST(reason) do { \
+    wn_mark_test_skipped(); \
+    printf("  SKIP %s: %s\n", wn_current_test, reason); \
+    fflush(stdout); \
+    return; \
+} while (0)
 
 #define WN_FAIL(fmt, ...) do { \
     wn_tests_failed++; \
@@ -111,7 +134,7 @@ static jmp_buf wn_test_jmp;
 } while (0)
 
 #define TEST_SUMMARY() do { \
-    printf("\n%d run, %d failed\n", wn_tests_run, wn_tests_failed); \
+    printf("\n%d run, %d failed, %d skipped\n", wn_tests_run, wn_tests_failed, wn_tests_skipped); \
     return wn_tests_failed == 0 ? 0 : 1; \
 } while (0)
 
