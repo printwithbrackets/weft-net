@@ -3,14 +3,28 @@
  * handshake and delivery modes inside binary WebSocket frames. */
 #include "../test_framework.h"
 #include "../../include/weft_net.h"
+#include "../../src/websocket.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <poll.h>
+
+static bool write_all(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;
+        return false;
+    }
+    return true;
+}
 
 static bool wait_for_event(wn_endpoint_t *ep, wn_event_type_t type, wn_event_t *out, int timeout_ms) {
     uint64_t iterations = (uint64_t)timeout_ms / 50 + 1;
@@ -291,6 +305,73 @@ TEST(test_ws_reaps_pre_upgrade_links) {
     wn_endpoint_destroy(server);
 }
 
+/* A client may close with up to 125 bytes (a two-byte status code plus a
+ * reason). The server must echo that close back before dropping the link.
+ * The old 16-byte echo buffer could not hold a legal 125-byte close, so
+ * wn_ws_encode returned 0 and the echo silently never went out. */
+TEST(test_ws_close_echo_carries_full_payload) {
+    wn_config_t cfg; ws_config(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34981);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+
+    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_TRUE(sock >= 0);
+    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(bind_addr.port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    ASSERT_EQ(connect(sock, (struct sockaddr *)&sa, sizeof(sa)), 0);
+
+    char req[512];
+    size_t req_len = 0;
+    char key[25];
+    ASSERT_TRUE(wn_ws_build_client_request("127.0.0.1", bind_addr.port, "/", req,
+                                           sizeof(req), &req_len, key));
+    ASSERT_TRUE(write_all(sock, (const uint8_t *)req, req_len));
+
+    char resp[512];
+    ASSERT_TRUE(recv(sock, resp, sizeof(resp), 0) > 0);
+
+    /* 125-byte close body: status 1000 (normal closure) plus a 123-byte
+     * reason. Client-to-server frames must be masked (RFC 6455 §5.3). */
+    uint8_t payload[125];
+    payload[0] = 0x03; payload[1] = 0xE8;
+    memset(payload + 2, 'r', sizeof(payload) - 2);
+    uint8_t frame[256];
+    size_t fn = wn_ws_encode(WN_WS_OPCODE_CLOSE, payload, sizeof(payload), true,
+                             frame, sizeof(frame));
+    ASSERT_TRUE(fn > 0);
+    ASSERT_TRUE(write_all(sock, frame, fn));
+
+    /* Read the echoed close back and decode it. The server side is
+     * unmasked, and the decoder accepts either masking. */
+    wn_ws_decoder_t dec; wn_ws_decoder_init(&dec);
+    uint8_t opcode = 0, msg[256]; size_t msg_len = 0;
+    bool got_close = false;
+    for (int i = 0; i < 20 && !got_close; i++) {
+        uint8_t buf[256];
+        ssize_t n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        if (wn_ws_decoder_feed(&dec, buf, (size_t)n) != 0) break;
+        int rc;
+        while ((rc = wn_ws_decoder_next(&dec, &opcode, msg, sizeof(msg), &msg_len)) == 1) {
+            if (opcode == WN_WS_OPCODE_CLOSE) { got_close = true; break; }
+        }
+        if (rc < 0) break;
+    }
+    ASSERT_TRUE(got_close);
+    ASSERT_EQ(msg_len, sizeof(payload));
+    ASSERT_MEM_EQ(msg, payload, sizeof(payload));
+
+    wn_ws_decoder_free(&dec);
+    close(sock);
+    wn_endpoint_destroy(server);
+}
+
 int main(void) {
     printf("websocket integration tests\n");
     RUN_TEST(test_ws_connect_and_reliable_echo);
@@ -301,5 +382,6 @@ int main(void) {
     RUN_TEST(test_ws_failed_connect_does_not_leak_pending);
     RUN_TEST(test_ws_rst_listener_leaks_nothing);
     RUN_TEST(test_ws_reaps_pre_upgrade_links);
+    RUN_TEST(test_ws_close_echo_carries_full_payload);
     TEST_SUMMARY();
 }

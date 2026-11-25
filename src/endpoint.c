@@ -74,6 +74,12 @@
  * is reassembled. */
 #define WN_WS_LINK_MAX (WN_MAX_CONNECTIONS_INTERNAL + WN_MAX_PENDING)
 #define WN_WS_RECV_CHUNK 2048
+/* RFC 6455 §5.5 caps control-frame payloads at 125 bytes. Echoing a close
+ * frame must fit the largest legal one: a 2-byte header, a 4-byte mask key
+ * (client side, the worst case), and the echoed payload. A smaller buffer
+ * silently dropped the echo. */
+#define WN_WS_CONTROL_MAX_PAYLOAD 125
+#define WN_WS_CLOSE_ECHO_MAX (2 + 4 + WN_WS_CONTROL_MAX_PAYLOAD)
 
 typedef struct ws_link {
     struct ws_link *next;
@@ -1527,8 +1533,10 @@ static bool ws_handle_message(wn_endpoint_t *ep, ws_link_t *link, uint8_t opcode
     }
     if (opcode == WN_WS_OPCODE_PONG) return true;
     if (opcode == WN_WS_OPCODE_CLOSE) {
-        /* Echo close then drop. */
-        uint8_t cl[16];
+        /* Echo close then drop. The peer may legitimately send up to 125
+         * bytes (status code plus reason), so the buffer must fit the
+         * largest legal control frame or the echo is lost. */
+        uint8_t cl[WN_WS_CLOSE_ECHO_MAX];
         size_t n = wn_ws_encode(WN_WS_OPCODE_CLOSE, msg, len, !ep->is_server, cl, sizeof(cl));
         if (n > 0) sock_write_all(link->sock, cl, n);
         return false;
