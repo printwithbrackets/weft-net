@@ -54,6 +54,13 @@
 #define WN_RATE_LIMIT_WINDOW_MS 1000
 #define WN_RATE_LIMIT_MAX_PER_WINDOW 200
 #define WN_IO_POLL_INTERVAL_MS 50
+
+/* Max datagrams drained from one UDP socket per poll cycle. A peer that
+ * keeps the socket readable must not monopolize the single I/O thread: the
+ * level-triggered poll reports the socket again immediately, so nothing is
+ * lost, and connection ticks (keepalives, retransmits, ack flushes), the
+ * other sockets, and pending-handshake expiry all get a turn in between. */
+#define WN_UDP_READ_MAX_PER_CYCLE 32
 /* WebSocket link lifetimes: a connecting link gets WN_WS_CONNECT_TIMEOUT_
  * MS to finish TCP + HTTP upgrade + the WN handshake; after that any
  * link that has not moved a byte for WN_WS_IDLE_TIMEOUT_MS is closed.
@@ -1944,7 +1951,7 @@ static void *io_thread_main(void *arg) {
 
         if (rc > 0) {
             if (main_idx >= 0 && (fds[main_idx].revents & POLLIN)) {
-                for (;;) {
+                for (int i = 0; i < WN_UDP_READ_MAX_PER_CYCLE; i++) {
                     struct sockaddr_storage from; socklen_t from_len = sizeof(from);
                     memset(&from, 0, sizeof(from));
                     ssize_t n = recvfrom(ep->sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
@@ -1954,7 +1961,7 @@ static void *io_thread_main(void *arg) {
                 }
             }
             if (disc_idx >= 0 && (fds[disc_idx].revents & POLLIN)) {
-                for (;;) {
+                for (int i = 0; i < WN_UDP_READ_MAX_PER_CYCLE; i++) {
                     struct sockaddr_storage from; socklen_t from_len = sizeof(from);
                     memset(&from, 0, sizeof(from));
                     ssize_t n = recvfrom(dsock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);

@@ -1747,6 +1747,110 @@ TEST(test_valid_response_completes_while_budget_is_exhausted) {
     wn_endpoint_destroy(server);
 }
 
+/* ---- I/O fairness under a game-socket flood ---- */
+
+typedef struct {
+    int sock;
+    struct sockaddr_in dst;
+    uint8_t pkt[1 + 8 + 8 + 1200];
+    size_t pkt_len;
+    _Atomic bool stop;
+    _Atomic unsigned long sent;
+} udp_flood_t;
+
+/* Flood a peer's game socket with DATA frames for a real connection id and
+ * a far-future counter. The counter always passes the replay pre-check, so
+ * every datagram forces a full AEAD decryption before the bad tag rejects
+ * it. That is enough receiver-side work to keep the socket readable for as
+ * long as the senders run. */
+static void *udp_flood_main(void *arg) {
+    udp_flood_t *f = (udp_flood_t *)arg;
+    while (!atomic_load(&f->stop)) {
+        if (sendto(f->sock, f->pkt, f->pkt_len, 0,
+                   (struct sockaddr *)&f->dst, sizeof(f->dst)) >= 0)
+            atomic_fetch_add(&f->sent, 1);
+    }
+    return NULL;
+}
+
+/* A sustained flood must not stop the I/O thread from running connection
+ * ticks. Before the fix the game-socket recv loop ran until EAGAIN, so a
+ * flood that kept that socket readable delayed keepalives, retransmits and
+ * ack flushes indefinitely. Keepalives are the observable: with ticks
+ * running the flooded endpoint still sends them once a second. */
+TEST(test_udp_flood_does_not_starve_connection_ticks) {
+    wn_config_t cfg; wn_config_default(&cfg);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", 34721);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
+
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
+    wn_peer_id_t server_peer = ev.peer;
+
+    /* The server knows the client's source address, which is the socket
+     * the flood has to hit to starve the client's own I/O thread. */
+    wn_address_t client_addr;
+    ASSERT_TRUE(wn_peer_address(server, server_peer, &client_addr));
+
+    /* [type][connection_id][counter][ciphertext][tag]. The counter is far
+     * ahead of anything sent, so it is never rejected as a replay before
+     * the decrypt attempt. */
+    uint8_t pkt[1 + 8 + 8 + 1200];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = WN_PKT_DATA;
+    wn_put_u64(pkt + 1, client_peer);
+    wn_put_u64(pkt + 9, 1000000000ULL);
+    memset(pkt + 17, 0x5A, sizeof(pkt) - 17);
+
+    enum { FLOODERS = 8 };
+    udp_flood_t f[FLOODERS];
+    pthread_t ft[FLOODERS];
+    for (int i = 0; i < FLOODERS; i++) {
+        memset(&f[i], 0, sizeof(f[i]));
+        memcpy(f[i].pkt, pkt, sizeof(pkt));
+        f[i].pkt_len = sizeof(pkt);
+        f[i].sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        ASSERT_TRUE(f[i].sock >= 0);
+        int fl = fcntl(f[i].sock, F_GETFL, 0);
+        ASSERT_TRUE(fl >= 0);
+        /* Nonblocking: a full socket buffer must not park the flooder,
+         * or the backlog could drain and hide the starvation. */
+        ASSERT_EQ(fcntl(f[i].sock, F_SETFL, fl | O_NONBLOCK), 0);
+        f[i].dst = loopback_addr(client_addr.port);
+        ASSERT_EQ(pthread_create(&ft[i], NULL, udp_flood_main, &f[i]), 0);
+    }
+
+    wn_peer_stats_t before, during;
+    ASSERT_TRUE(wn_peer_stats(client, client_peer, &before));
+
+    /* The keepalive interval is one second, so 1.6s spans at least one
+     * tick even with scheduling jitter. */
+    usleep(1600 * 1000);
+    ASSERT_TRUE(wn_peer_stats(client, client_peer, &during));
+
+    for (int i = 0; i < FLOODERS; i++) atomic_store(&f[i].stop, true);
+    unsigned long sent = 0;
+    for (int i = 0; i < FLOODERS; i++) {
+        pthread_join(ft[i], NULL);
+        close(f[i].sock);
+        sent += atomic_load(&f[i].sent);
+    }
+
+    /* Sanity: the flood actually ran, so a passing tick is meaningful. */
+    ASSERT_TRUE(sent > 1000);
+    /* Ticks ran during the flood: the client sent keepalives (or replied
+     * to the server's) instead of being stuck draining the socket. */
+    ASSERT_TRUE(during.packets_sent > before.packets_sent);
+
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
+}
+
 int main(void) {
     printf("=== integration tests (real UDP sockets) ===\n");
     RUN_TEST(test_server_challenge_retransmit_roundtrips_at_full_length);
@@ -1788,5 +1892,6 @@ int main(void) {
     RUN_TEST(test_event_queue_cap_bounds_hostile_flood);
     RUN_TEST(test_event_queue_cap_legit_traffic_flows);
     RUN_TEST(test_server_clamps_negotiated_channel_count);
+    RUN_TEST(test_udp_flood_does_not_starve_connection_ticks);
     TEST_SUMMARY();
 }
