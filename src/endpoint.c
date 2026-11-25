@@ -74,6 +74,12 @@
  * is reassembled. */
 #define WN_WS_LINK_MAX (WN_MAX_CONNECTIONS_INTERNAL + WN_MAX_PENDING)
 #define WN_WS_RECV_CHUNK 2048
+/* RFC 6455 §5.5 caps control-frame payloads at 125 bytes. Echoing a close
+ * frame must fit the largest legal one: a 2-byte header, a 4-byte mask key
+ * (client side, the worst case), and the echoed payload. A smaller buffer
+ * silently dropped the echo. */
+#define WN_WS_CONTROL_MAX_PAYLOAD 125
+#define WN_WS_CLOSE_ECHO_MAX (2 + 4 + WN_WS_CONTROL_MAX_PAYLOAD)
 
 /* Outbound frames are queued whole and drained on POLLOUT, never written
  * from inside a lock or a blocking poll: a peer that sends pings and never
@@ -1678,11 +1684,10 @@ static bool ws_handle_message(wn_endpoint_t *ep, ws_link_t *link, uint8_t opcode
     }
     if (opcode == WN_WS_OPCODE_PONG) return true;
     if (opcode == WN_WS_OPCODE_CLOSE) {
-        /* Echo close then drop. Best effort: this frame may not fit, and
-         * the peer may not be reading, so never wait for it. The send is
-         * serialized with queue flushes so it cannot interleave into a
-         * half-written frame. */
-        uint8_t cl[16];
+        /* Allow the largest legal close frame, including the client mask.
+         * Serialize the best-effort echo with queue flushes and drop
+         * the link without waiting for a peer that is not reading. */
+        uint8_t cl[WN_WS_CLOSE_ECHO_MAX];
         size_t n = wn_ws_encode(WN_WS_OPCODE_CLOSE, msg, len, !ep->is_server, cl, sizeof(cl));
         if (n > 0) {
             pthread_mutex_lock(&ep->ws_links_lock);

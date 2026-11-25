@@ -260,6 +260,26 @@ TEST(test_handshake_client_request_and_server_accept_roundtrip) {
     ASSERT_TRUE(wn_ws_check_server_response(resp, resp_len, accept));
 }
 
+/* RFC 7230 §5.4: an IPv6 literal in the Host header must be bracketed,
+ * otherwise the colons read as port separators and the peer parses the
+ * wrong host. A bare "::1" used to be copied verbatim. */
+TEST(test_handshake_brackets_ipv6_host) {
+    char req[512];
+    size_t req_len = 0;
+    char accept[32];
+    ASSERT_TRUE(wn_ws_build_client_request("::1", 8080, "/", req, sizeof(req),
+                                           &req_len, accept));
+    ASSERT_TRUE(req_len > 0);
+    ASSERT_TRUE(strstr(req, "Host: [::1]:8080") != NULL);
+    ASSERT_TRUE(wn_ws_check_client_request(req, req_len));
+
+    /* A caller that already passes brackets must not get double-wrapped. */
+    ASSERT_TRUE(wn_ws_build_client_request("[2001:db8::1]", 443, "/", req, sizeof(req),
+                                           &req_len, accept));
+    ASSERT_TRUE(strstr(req, "Host: [2001:db8::1]:443") != NULL);
+    ASSERT_TRUE(strstr(req, "[[") == NULL);
+}
+
 TEST(test_handshake_rejects_non_websocket_request) {
     const char *req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
     ASSERT_FALSE(wn_ws_check_client_request(req, strlen(req)));
@@ -446,6 +466,7 @@ int main(void) {
     RUN_TEST(test_frame_decode_rejects_rsv_bits);
     RUN_TEST(test_handshake_rfc6455_test_vector);
     RUN_TEST(test_handshake_client_request_and_server_accept_roundtrip);
+    RUN_TEST(test_handshake_brackets_ipv6_host);
     RUN_TEST(test_handshake_rejects_non_websocket_request);
     RUN_TEST(test_handshake_rejects_wrong_accept_from_server);
     RUN_TEST(test_handshake_rejects_not_101);

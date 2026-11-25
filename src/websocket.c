@@ -457,6 +457,19 @@ bool wn_ws_build_client_request(const char *host, uint16_t port, const char *pat
     wn_crypto_random(nonce, sizeof(nonce));
     if (!wn_ws_base64_encode(nonce, sizeof(nonce), accept_key_out, 25)) return false;
 
+    /* IPv6 literals must be bracketed in the Host header (RFC 7230 §5.4):
+     * "Host: [::1]:8080". An unbracketed literal is ambiguous with the
+     * port separator, so the peer would parse the wrong host. The host is
+     * only wrapped when it is not already bracketed, which keeps callers
+     * that pass "[::1]" working. */
+    char host_buf[128];
+    const char *host_hdr = host;
+    if (strchr(host, ':') && host[0] != '[') {
+        int hn = snprintf(host_buf, sizeof(host_buf), "[%s]", host);
+        if (hn < 0 || (size_t)hn >= sizeof(host_buf)) return false;
+        host_hdr = host_buf;
+    }
+
     int n = snprintf(out, out_cap,
                      "GET %s HTTP/1.1\r\n"
                      "Host: %s:%u\r\n"
@@ -465,7 +478,7 @@ bool wn_ws_build_client_request(const char *host, uint16_t port, const char *pat
                      "Sec-WebSocket-Key: %s\r\n"
                      "Sec-WebSocket-Version: 13\r\n"
                      "\r\n",
-                     path, host, (unsigned)port, accept_key_out);
+                     path, host_hdr, (unsigned)port, accept_key_out);
     if (n < 0 || (size_t)n >= out_cap) return false;
     *out_len = (size_t)n;
     return true;
