@@ -3,6 +3,8 @@
  * handshake and delivery modes inside binary WebSocket frames. */
 #include "../test_framework.h"
 #include "../../include/weft_net.h"
+#include "../../src/websocket.h"
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -11,6 +13,45 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <poll.h>
+#include <pthread.h>
+#include <time.h>
+#include <fcntl.h>
+
+static uint64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+/* Bind a UDP socket to port 0, read the kernel-assigned port back, and
+ * release it. The port is free again as soon as close() returns; the test
+ * binds it again immediately, so a racing process grabbing it in between
+ * is unlikely. */
+static uint16_t free_port(void) {
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = inet_addr("127.0.0.1");
+    bind(s, (struct sockaddr *)&a, sizeof(a));
+    socklen_t len = sizeof(a);
+    getsockname(s, (struct sockaddr *)&a, &len);
+    uint16_t p = (uint16_t)ntohs(a.sin_port);
+    close(s);
+    return p;
+}
+
+static bool write_all(int fd, const uint8_t *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t w = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+        if (w > 0) { off += (size_t)w; continue; }
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return false;
+        if (w < 0) return false;
+        if (w == 0) return false;
+    }
+    return true;
+}
 
 static bool wait_for_event(wn_endpoint_t *ep, wn_event_type_t type, wn_event_t *out, int timeout_ms) {
     uint64_t iterations = (uint64_t)timeout_ms / 50 + 1;
@@ -291,6 +332,127 @@ TEST(test_ws_reaps_pre_upgrade_links) {
     wn_endpoint_destroy(server);
 }
 
+/* The legitimate client dials the same server while the attacker is still
+ * flooding. It must complete the TCP upgrade and the encrypted handshake
+ * inside the two-second budget. */
+typedef struct {
+    wn_endpoint_t *client;
+    wn_address_t addr;
+    bool connected;
+    uint64_t elapsed_ms;
+} legit_ctx_t;
+
+static void *legit_connect_thread(void *arg) {
+    legit_ctx_t *c = (legit_ctx_t *)arg;
+    wn_peer_id_t peer;
+    uint64_t start = now_ms();
+    wn_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    if (wn_connect(c->client, &c->addr, &peer) == WN_OK) {
+        c->connected = wait_for_event(c->client, WN_EVENT_CONNECTED, &ev, 2000);
+    }
+    c->elapsed_ms = now_ms() - start;
+    return NULL;
+}
+
+/* A peer that sends pings and never reads used to stall the single I/O
+ * thread inside sock_write_all (poll(POLLOUT) for up to a second, while
+ * holding the connection and WebSocket link locks), so an unrelated
+ * legitimate client could not complete its handshake. The fix queues
+ * whole frames on a bounded per-link buffer and flushes them on POLLOUT,
+ * so the I/O thread never waits on a stuck peer. */
+TEST(test_ws_peer_ping_flood_does_not_block_other_clients) {
+    uint16_t port = free_port();
+    wn_config_t cfg; ws_config(&cfg);
+    wn_endpoint_t *server = NULL;
+    wn_address_t bind_addr = addr("127.0.0.1", port);
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+
+    /* Attacker: raw TCP client, complete just the HTTP upgrade, then flood
+     * masked pings and never read the pongs. The tiny receive buffer makes
+     * the server's send buffer fill after a few hundred pongs, and the
+     * socket goes nonblocking below so a stalled server cannot wedge this
+     * thread (the deadline still gets checked). */
+    int atk = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_TRUE(atk >= 0);
+    int rcvbuf = 4096;
+    setsockopt(atk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    ASSERT_EQ(connect(atk, (struct sockaddr *)&sa, sizeof(sa)), 0);
+
+    char req[512];
+    size_t req_len = 0;
+    char key[25];
+    ASSERT_TRUE(wn_ws_build_client_request("127.0.0.1", port, "/", req, sizeof(req),
+                                            &req_len, key));
+    ASSERT_TRUE(write_all(atk, (const uint8_t *)req, req_len));
+
+    char resp[512];
+    ASSERT_TRUE(recv(atk, resp, sizeof(resp), 0) > 0);
+
+    int fl = fcntl(atk, F_GETFL, 0);
+    ASSERT_TRUE(fl >= 0);
+    ASSERT_EQ(fcntl(atk, F_SETFL, fl | O_NONBLOCK), 0);
+
+    /* Warm the flood up first: the old code only wedges once the server's
+     * send buffer for this link is full. Starting the legitimate client
+     * afterwards means its two-second budget overlaps the stalled window
+     * instead of racing the first few pings. */
+    uint8_t payload[100];
+    memset(payload, 0xAB, sizeof(payload));
+    uint8_t frame[2 + 4 + sizeof(payload)];
+    uint64_t warmup_end = now_ms() + 1500;
+    while (now_ms() < warmup_end) {
+        size_t n = wn_ws_encode(WN_WS_OPCODE_PING, payload, sizeof(payload), true,
+                                frame, sizeof(frame));
+        if (n == 0) break;
+        if (!write_all(atk, frame, n)) {
+            struct timespec ts = { 0, 10 * 1000 * 1000L };
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    /* Legitimate client starts now, while the flood is in progress. */
+    legit_ctx_t legit;
+    memset(&legit, 0, sizeof(legit));
+    legit.addr = bind_addr;
+    ASSERT_EQ(wn_client_create(&cfg, &legit.client), WN_OK);
+    pthread_t tid;
+    ASSERT_EQ(pthread_create(&tid, NULL, legit_connect_thread, &legit), 0);
+
+    /* Keep flooding without reading. The write itself starts failing once
+     * the attacker's own send buffer fills, which is fine: by then the
+     * server's send buffer for this link is already full. The ping is
+     * 100 bytes so the pong fits the server's existing control-frame
+     * buffer: this test is about the write path, not control-frame
+     * sizing (which has its own conformance tests). */
+    uint64_t deadline = now_ms() + 5000;
+    while (now_ms() < deadline) {
+        size_t n = wn_ws_encode(WN_WS_OPCODE_PING, payload, sizeof(payload), true,
+                                frame, sizeof(frame));
+        if (n == 0) break;
+        if (!write_all(atk, frame, n)) {
+            struct timespec ts = { 0, 10 * 1000 * 1000L };
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    pthread_join(tid, NULL);
+
+    /* The legitimate client must have completed, and quickly: the old
+     * code leaves it starved while the I/O thread waits on the attacker. */
+    ASSERT_TRUE(legit.connected);
+    ASSERT_TRUE(legit.elapsed_ms < 2000);
+
+    close(atk);
+    wn_endpoint_destroy(legit.client);
+    wn_endpoint_destroy(server);
+}
+
 int main(void) {
     printf("websocket integration tests\n");
     RUN_TEST(test_ws_connect_and_reliable_echo);
@@ -301,5 +463,6 @@ int main(void) {
     RUN_TEST(test_ws_failed_connect_does_not_leak_pending);
     RUN_TEST(test_ws_rst_listener_leaks_nothing);
     RUN_TEST(test_ws_reaps_pre_upgrade_links);
+    RUN_TEST(test_ws_peer_ping_flood_does_not_block_other_clients);
     TEST_SUMMARY();
 }
