@@ -47,9 +47,18 @@ extern "C" {
   #else
     #define WN_ABI_ASSERT(cond, msg) ((void)0)
   #endif
+#elif defined(__cplusplus) && __cplusplus >= 201103L && !defined(WN_SKIP_ABI_ASSERTS)
+  /* C++ consumers reach this branch: __STDC_VERSION__ is not defined in
+   * C++, and the old ((void)0) fallback is not a valid declaration at
+   * namespace scope, so including this header from C++ failed to compile. */
+  #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL
+    #define WN_ABI_ASSERT(cond, msg) static_assert(cond, msg)
+  #else
+    #define WN_ABI_ASSERT(cond, msg) ((void)0)
+  #endif
 #else
-  /* Pre-C11 (or C++ without _Static_assert): no compile-time guard. The
-   * binding tests still check the sizes at runtime. */
+  /* Pre-C11 C: no compile-time guard. The binding tests still check the
+   * sizes at runtime. */
   #define WN_ABI_ASSERT(cond, msg) ((void)0)
 #endif
 

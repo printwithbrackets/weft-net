@@ -81,6 +81,29 @@
 #define WN_WS_CONTROL_MAX_PAYLOAD 125
 #define WN_WS_CLOSE_ECHO_MAX (2 + 4 + WN_WS_CONTROL_MAX_PAYLOAD)
 
+/* Outbound frames are queued whole and drained on POLLOUT, never written
+ * from inside a lock or a blocking poll: a peer that sends pings and never
+ * reads must not wedge the single I/O thread. The caps bound per-link
+ * memory; when they are hit a data frame is dropped (the reliability layer
+ * retransmits it) while a link that stays stuck long enough is closed. */
+#define WN_WS_OUTBUF_MAX_BYTES (64 * 1024)
+#define WN_WS_OUTBUF_MAX_FRAMES 32
+#define WN_WS_OUTBUF_STUCK_MS 2000
+
+/* Queue marker for raw HTTP handshake bytes (not a WebSocket opcode). */
+#define WN_WS_OUT_RAW 0xFF
+
+/* One already-encoded WebSocket frame waiting for the socket to accept it.
+ * `off` tracks a partially written frame so the remainder is finished on a
+ * later POLLOUT instead of being abandoned mid-frame. */
+typedef struct ws_out_frame {
+    struct ws_out_frame *next;
+    uint16_t len;
+    uint16_t off;
+    uint8_t opcode;
+    uint8_t data[];
+} ws_out_frame_t;
+
 typedef struct ws_link {
     struct ws_link *next;
     wn_socket_t sock;
@@ -94,6 +117,17 @@ typedef struct ws_link {
     size_t http_len;
     char client_key[25];      /* Sec-WebSocket-Key we sent (client only) */
     wn_ws_decoder_t decoder;
+    /* Bounded outbound queue, drained without ever waiting on the peer.
+     * Guarded by ws_links_lock like the rest of the link's mutable state.
+     * out_bytes/out_frames are the caps; out_stuck_since_ms is when a
+     * non-empty queue last stopped making progress, so a peer that will
+     * not read is eventually closed instead of holding memory forever. */
+    ws_out_frame_t *out_head;
+    ws_out_frame_t *out_tail;
+    size_t out_bytes;
+    uint16_t out_frames;
+    uint64_t out_stuck_since_ms;
+    bool out_error;           /* hard send error: link needs closing */
     uint64_t created_ms;
     /* Read-side activity marker for the IO thread's reap sweep: bumped
      * whenever this link moved bytes (TCP data in, upgrade request out).
@@ -423,30 +457,135 @@ static uint32_t count_active_connections_locked(wn_endpoint_t *ep) {
 
 /* ---- WebSocket links ---- */
 
-/* Blocking-ish write of a full buffer on a (possibly nonblocking) TCP
- * socket. Returns false on hard error or if the peer stays unwritable
- * for >1s (keeps the IO thread from wedging on a dead connection). */
-static bool sock_write_all(wn_socket_t s, const uint8_t *buf, size_t len) {
+/* Best-effort, nonblocking send used only for the close echo: RFC 6455
+ * says the echo is a courtesy, and the link is dropped either way, so a
+ * peer that will not read must never stall the IO thread here. */
+static void sock_send_best_effort(wn_socket_t s, const uint8_t *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
         ssize_t w = send(s, buf + off, len - off, MSG_NOSIGNAL);
         if (w > 0) { off += (size_t)w; continue; }
-        if (w < 0 && (wn_sock_errno() == EAGAIN || wn_sock_errno() == EWOULDBLOCK)) {
-            struct pollfd p;
-            p.fd = s; p.events = POLLOUT; p.revents = 0;
-            if (poll(&p, 1, 1000) <= 0) return false;
-            continue;
-        }
-        return false;
+        return; /* EAGAIN or hard error: give up on the echo */
     }
-    return true;
+}
+
+static void ws_out_queue_free(ws_link_t *l) {
+    ws_out_frame_t *f = l->out_head;
+    while (f) {
+        ws_out_frame_t *n = f->next;
+        free(f);
+        f = n;
+    }
+    l->out_head = l->out_tail = NULL;
+    l->out_bytes = 0;
+    l->out_frames = 0;
+    l->out_stuck_since_ms = 0;
 }
 
 static void ws_link_free(ws_link_t *l) {
     if (!l) return;
     if (l->sock != WN_INVALID_SOCKET) wn_close_socket(l->sock);
+    ws_out_queue_free(l);
     wn_ws_decoder_free(&l->decoder);
     free(l);
+}
+
+/* Append one already-encoded frame. Caller holds ws_links_lock.
+ *
+ * Pongs coalesce onto the newest ping: a peer that sends pings faster
+ * than it reads must not grow the queue by one reply per ping. Data
+ * frames are never coalesced (each carries a distinct WN packet). */
+static bool ws_link_enqueue_locked(ws_link_t *l, uint8_t opcode,
+                                   const uint8_t *buf, size_t len) {
+    if (len == 0 || len > UINT16_MAX) return false;
+    if (opcode == WN_WS_OPCODE_PONG) {
+        ws_out_frame_t **pp = &l->out_head;
+        while (*pp) {
+            ws_out_frame_t *f = *pp;
+            /* Never drop a partially written frame: its first bytes are
+             * already on the wire and freeing it would splice the next
+             * frame into the middle of it. */
+            if (f->opcode != WN_WS_OPCODE_PONG || f->off != 0) {
+                pp = &f->next;
+                continue;
+            }
+            *pp = f->next;
+            if (l->out_tail == f) l->out_tail = NULL; /* rebuilt below */
+            l->out_bytes -= f->len;
+            l->out_frames--;
+            free(f);
+        }
+        /* Recompute the tail after removals (cheap: queue is short). */
+        l->out_tail = NULL;
+        for (ws_out_frame_t *f = l->out_head; f; f = f->next) l->out_tail = f;
+    }
+    if (l->out_frames >= WN_WS_OUTBUF_MAX_FRAMES ||
+        l->out_bytes + len > WN_WS_OUTBUF_MAX_BYTES)
+        return false;
+    ws_out_frame_t *f = (ws_out_frame_t *)malloc(sizeof(*f) + len);
+    if (!f) return false;
+    f->next = NULL;
+    f->len = (uint16_t)len;
+    f->off = 0;
+    f->opcode = opcode;
+    memcpy(f->data, buf, len);
+    if (l->out_tail) l->out_tail->next = f;
+    else l->out_head = f;
+    l->out_tail = f;
+    l->out_bytes += len;
+    l->out_frames++;
+    return true;
+}
+
+/* Push as much of the queue as the socket accepts right now. Caller holds
+ * ws_links_lock. Never waits: a partial frame keeps its offset and the
+ * remainder is finished on the next POLLOUT. Returns bytes written. */
+static size_t ws_link_flush_locked(ws_link_t *l, uint64_t now) {
+    size_t sent = 0;
+    while (l->out_head) {
+        ws_out_frame_t *f = l->out_head;
+        ssize_t w = send(l->sock, f->data + f->off, f->len - f->off, MSG_NOSIGNAL);
+        if (w > 0) {
+            f->off = (uint16_t)(f->off + (uint16_t)w);
+            sent += (size_t)w;
+            if (f->off < f->len) break; /* socket full, keep the remainder */
+            l->out_head = f->next;
+            if (!l->out_head) l->out_tail = NULL;
+            l->out_bytes -= f->len;
+            l->out_frames--;
+            free(f);
+            continue;
+        }
+        if (w < 0) {
+            int e = wn_sock_errno();
+            if (e == EAGAIN || e == EWOULDBLOCK) break;
+            l->out_error = true;
+        }
+        break;
+    }
+    if (!l->out_head) {
+        l->out_stuck_since_ms = 0;
+    } else if (sent > 0) {
+        l->out_stuck_since_ms = now; /* still draining: progress */
+    } else if (l->out_stuck_since_ms == 0) {
+        l->out_stuck_since_ms = now;
+    }
+    return sent;
+}
+
+/* Queue a frame and try to send it immediately. Caller holds
+ * ws_links_lock. Returns false only when the frame was not queued: data
+ * frames are then dropped (the reliability layer retransmits them) while
+ * a stuck control/upgrade frame marks the link for closing. */
+static bool ws_link_send_locked(ws_link_t *l, uint8_t opcode,
+                                const uint8_t *buf, size_t len, uint64_t now) {
+    if (!ws_link_enqueue_locked(l, opcode, buf, len)) {
+        if (opcode != WN_WS_OPCODE_BINARY && opcode != WN_WS_OPCODE_TEXT)
+            l->out_error = true;
+        return false;
+    }
+    ws_link_flush_locked(l, now);
+    return true;
 }
 
 static void ws_add_link_locked(wn_endpoint_t *ep, ws_link_t *l) {
@@ -623,10 +762,12 @@ static void ws_link_drop_peer_state(wn_endpoint_t *ep, const struct sockaddr_sto
  * WebSocket: binary frame on the upgraded TCP link for that address
  * (no-op if the link is missing or still mid-HTTP-handshake).
  *
- * WebSocket path holds ws_links_lock across the write so a concurrent
- * ws_close_link/ws_drain_dead cannot free the link under us. Callers
- * already hold connections_lock (or pending_lock) when they got here
- * from a connection callback -- matching the documented lock order. */
+ * The frame is queued and sent nonblocking; this never waits on a slow
+ * peer. ws_links_lock is held while touching the queue (which keeps a
+ * concurrent ws_close_link/ws_drain_dead from freeing the link under us)
+ * but no wait happens under it. Callers already hold connections_lock
+ * (or pending_lock) when they got here from a connection callback --
+ * matching the documented lock order. */
 static bool ep_send_wn(wn_endpoint_t *ep, const struct sockaddr_storage *addr, socklen_t addr_len,
                        const uint8_t *pkt, size_t len) {
     if (ep->config.transport == WN_TRANSPORT_WEBSOCKET) {
@@ -640,7 +781,8 @@ static bool ep_send_wn(wn_endpoint_t *ep, const struct sockaddr_storage *addr, s
             /* Client endpoints mask (RFC 6455 §5.3); servers do not. */
             uint8_t frame[16 + WN_WS_MAX_MESSAGE];
             size_t n = wn_ws_encode_binary(pkt, len, !ep->is_server, frame, sizeof(frame));
-            if (n > 0) ok = sock_write_all(l->sock, frame, n);
+            if (n > 0)
+                ok = ws_link_send_locked(l, WN_WS_OPCODE_BINARY, frame, n, now_ms());
         }
         pthread_mutex_unlock(&ep->ws_links_lock);
         return ok;
@@ -1521,6 +1663,15 @@ static void flush_all_acks(wn_endpoint_t *ep, uint64_t now) {
 
 /* ---- I/O thread ---- */
 
+/* Queue one frame on a link (takes ws_links_lock) and try to send it. */
+static bool ws_queue_frame(wn_endpoint_t *ep, ws_link_t *l, uint8_t opcode,
+                           const uint8_t *buf, size_t len, uint64_t now) {
+    pthread_mutex_lock(&ep->ws_links_lock);
+    bool ok = ws_link_send_locked(l, opcode, buf, len, now);
+    pthread_mutex_unlock(&ep->ws_links_lock);
+    return ok;
+}
+
 /* Deliver one complete WebSocket message (an WN packet, or a control
  * frame to answer). Returns false if the link should be torn down. */
 static bool ws_handle_message(wn_endpoint_t *ep, ws_link_t *link, uint8_t opcode,
@@ -1528,17 +1679,21 @@ static bool ws_handle_message(wn_endpoint_t *ep, ws_link_t *link, uint8_t opcode
     if (opcode == WN_WS_OPCODE_PING) {
         uint8_t pong[128];
         size_t n = wn_ws_encode(WN_WS_OPCODE_PONG, msg, len, !ep->is_server, pong, sizeof(pong));
-        if (n > 0) sock_write_all(link->sock, pong, n);
+        if (n > 0) ws_queue_frame(ep, link, WN_WS_OPCODE_PONG, pong, n, now);
         return true;
     }
     if (opcode == WN_WS_OPCODE_PONG) return true;
     if (opcode == WN_WS_OPCODE_CLOSE) {
-        /* Echo close then drop. The peer may legitimately send up to 125
-         * bytes (status code plus reason), so the buffer must fit the
-         * largest legal control frame or the echo is lost. */
+        /* Allow the largest legal close frame, including the client mask.
+         * Serialize the best-effort echo with queue flushes and drop
+         * the link without waiting for a peer that is not reading. */
         uint8_t cl[WN_WS_CLOSE_ECHO_MAX];
         size_t n = wn_ws_encode(WN_WS_OPCODE_CLOSE, msg, len, !ep->is_server, cl, sizeof(cl));
-        if (n > 0) sock_write_all(link->sock, cl, n);
+        if (n > 0) {
+            pthread_mutex_lock(&ep->ws_links_lock);
+            sock_send_best_effort(link->sock, cl, n);
+            pthread_mutex_unlock(&ep->ws_links_lock);
+        }
         return false;
     }
     if (opcode != WN_WS_OPCODE_BINARY && opcode != WN_WS_OPCODE_TEXT) return false;
@@ -1585,7 +1740,8 @@ static bool ws_read_link(wn_endpoint_t *ep, ws_link_t *link, uint64_t now) {
                 size_t resp_len = 0;
                 if (!wn_ws_build_server_response(link->http_buf, hdr_end, resp, sizeof(resp), &resp_len))
                     return false;
-                if (!sock_write_all(link->sock, (const uint8_t *)resp, resp_len))
+                if (!ws_queue_frame(ep, link, WN_WS_OUT_RAW,
+                                    (const uint8_t *)resp, resp_len, now))
                     return false;
                 link->upgraded = true;
             } else {
@@ -1608,7 +1764,9 @@ static bool ws_read_link(wn_endpoint_t *ep, ws_link_t *link, uint64_t now) {
                 if (req_len > 0) {
                     uint8_t frame[16 + WN_WS_MAX_MESSAGE];
                     size_t fn = wn_ws_encode_binary(req, req_len, !ep->is_server, frame, sizeof(frame));
-                    if (fn == 0 || !sock_write_all(link->sock, frame, fn)) return false;
+                    if (fn == 0 ||
+                        !ws_queue_frame(ep, link, WN_WS_OPCODE_BINARY, frame, fn, now))
+                        return false;
                 }
             }
 
@@ -1655,7 +1813,8 @@ static bool ws_client_finish_connect(wn_endpoint_t *ep, ws_link_t *link) {
     if (!wn_ws_build_client_request(ha.host, ha.port, "/", link->http_buf, sizeof(link->http_buf),
                                     &req_len, link->client_key))
         return false;
-    if (!sock_write_all(link->sock, (const uint8_t *)link->http_buf, req_len)) {
+    if (!ws_queue_frame(ep, link, WN_WS_OUT_RAW,
+                        (const uint8_t *)link->http_buf, req_len, now_ms())) {
         ws_link_drop_peer_state(ep, &link->addr);
         return false;
     }
@@ -1700,6 +1859,33 @@ static void ws_accept_one(wn_endpoint_t *ep) {
     pthread_mutex_unlock(&ep->ws_links_lock);
 }
 
+/* Retry every link with queued output and close the ones that have made
+ * no progress for WN_WS_OUTBUF_STUCK_MS or hit a hard send error. Runs
+ * once per IO cycle; POLLOUT wakes poll promptly when the queue drains.
+ * Closing happens after the lock is dropped because ws_link_drop_peer_state
+ * takes connections_lock (lock order: connections -> ws_links). */
+static void ws_flush_links(wn_endpoint_t *ep, uint64_t now) {
+    ws_link_t *victims[WN_WS_LINK_MAX];
+    int n_victims = 0;
+
+    pthread_mutex_lock(&ep->ws_links_lock);
+    for (ws_link_t *l = ep->ws_links; l; l = l->next) {
+        if (!l->out_head && !l->out_error) continue;
+        if (!l->out_error) ws_link_flush_locked(l, now);
+        bool stuck = l->out_error ||
+                     (l->out_head && l->out_stuck_since_ms != 0 &&
+                      now - l->out_stuck_since_ms >= WN_WS_OUTBUF_STUCK_MS);
+        if (stuck && n_victims < WN_WS_LINK_MAX) victims[n_victims++] = l;
+    }
+    pthread_mutex_unlock(&ep->ws_links_lock);
+
+    for (int i = 0; i < n_victims; i++) {
+        struct sockaddr_storage a = victims[i]->addr;
+        ws_close_link(ep, victims[i]);
+        ws_link_drop_peer_state(ep, &a);
+    }
+}
+
 static void *io_thread_main(void *arg) {
     wn_endpoint_t *ep = (wn_endpoint_t *)arg;
     uint8_t buf[WN_RECV_BUFFER_SIZE];
@@ -1734,8 +1920,11 @@ static void *io_thread_main(void *arg) {
         pthread_mutex_lock(&ep->ws_links_lock);
         for (ws_link_t *l = ep->ws_links; l && nfds < POLL_STATIC + WN_WS_LINK_MAX; l = l->next) {
             /* While the nonblocking connect is in flight the socket is
-             * not readable for HTTP yet -- only watch for writability. */
+             * not readable for HTTP yet -- only watch for writability.
+             * Once upgraded, also watch POLLOUT when frames are waiting
+             * so the queue drains as soon as the peer accepts them. */
             short ev = l->client_connecting ? POLLOUT : POLLIN;
+            if (l->out_head) ev |= POLLOUT;
             fds[nfds].fd = l->sock;
             fds[nfds].events = ev;
             fds[nfds].revents = 0;
@@ -1841,6 +2030,7 @@ static void *io_thread_main(void *arg) {
         tick_all_connections(ep, now);
         retry_pending_handshakes(ep, now);
         expire_pending(ep, now);
+        ws_flush_links(ep, now);
         ws_reap_links(ep, now);
         /* Free links closed this cycle (and any moved to dead by user
          * threads) only after we're done using their pointers. */
