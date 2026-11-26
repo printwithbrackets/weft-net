@@ -856,9 +856,27 @@ static void ep_on_connected(void *ctx, wn_peer_id_t peer) {
     push_event(c->ep, ev, NULL, 0);
 }
 
+/* Same admission test push_event applies, without queueing anything. taken
+ * under queue_lock so the answer matches what push_event would decide. */
+
+/* Must match the rule in push_event(), and change both together. */
+static bool ep_can_accept(void *ctx, uint32_t len) {
+    conn_ctx_t *c = (conn_ctx_t *)ctx;
+    wn_endpoint_t *ep = c->ep;
+    bool ok = true;
+    pthread_mutex_lock(&ep->queue_lock);
+    if (ep->event_queue_cap != WN_EVENT_QUEUE_UNLIMITED &&
+        ep->event_queue_bytes + (uint64_t)len > (uint64_t)ep->event_queue_cap) {
+        ok = false;
+    }
+    pthread_mutex_unlock(&ep->queue_lock);
+    return ok;
+}
+
 static wn_conn_callbacks_t make_callbacks(conn_ctx_t *cctx) {
     wn_conn_callbacks_t cb;
     cb.on_data = ep_on_data;
+    cb.can_accept = ep_can_accept;
     cb.on_disconnected = ep_on_disconnected;
     cb.send_wire = ep_send_wire;
     cb.on_connected = ep_on_connected;

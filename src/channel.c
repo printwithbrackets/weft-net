@@ -321,13 +321,18 @@ void wn_channel_on_receive(wn_channel_t *chan, uint64_t now_ms,
     }
     const uint8_t *chunk = wire_payload + off;
     uint16_t chunk_len = (uint16_t)(wire_len - off);
+    
+    if (reliable && chan->accept && !chan->accept(chan->accept_ctx, is_fragment ? WN_MAX_MESSAGE_SIZE : chunk_len)) {
+        return;
+    }
 
     if (delivery == WN_UNRELIABLE) {
         deliver_or_reassemble(lane, now_ms, channel_id, delivery, is_fragment, message_id,
                                frag_index, frag_count, chunk, chunk_len, deliver, deliver_ctx);
         return;
     }
-
+    
+    /* fragments reserve WN_MAX_MESSAGE_SIZE, so a queue cap below that blocks them. */
     if (delivery == WN_UNRELIABLE_SEQUENCED) {
         if (!is_fragment) {
             if (lane->seq_has_received_any && !wn_seq_greater_than(seq, lane->seq_highest_seen)) {
@@ -427,6 +432,9 @@ void wn_channel_on_receive(wn_channel_t *chan, uint64_t now_ms,
 
     uint8_t pop_buf[WN_MAX_PACKET_SIZE];
     uint16_t pop_len;
+    /* Known gap: messages released together here are not re-checked against
+     * the event queue, so a refused one is acked and lost. make sure to 
+     * always peek before you pop. */
     while (wn_reorder_ring_pop_ready(&lane->reorder_ring, pop_buf, &pop_len)) {
         size_t p = 0;
         uint8_t pf = pop_buf[p++];

@@ -1446,6 +1446,49 @@ TEST(test_event_queue_cap_legit_traffic_flows) {
     wn_endpoint_destroy(server);
 }
 
+/* ---- reliable delivery survives a full event queue (R1) ---- */
+#define R1_PORT 34840
+#define R1_MSGS 20
+#define R1_MSG_LEN 200
+
+/* The server does not poll while the client sends, so the 2048-byte event
+ * cap fills after about ten messages. Before the fix those refused messages
+ * were acke anyway and never arrived. Every message must now arrive, in order,
+ * once the server starts draining its queue. */
+TEST(test_reliable_ordered_survives_full_event_queue) {
+    wn_config_t cfg; wn_config_default(&cfg);
+    cfg.event_queue_max_bytes = H1_MSG_CAP;
+    wn_address_t bind_addr = addr("127.0.0.1", R1_PORT);
+    wn_endpoint_t *server = NULL, *client = NULL;
+    ASSERT_EQ(wn_server_create(&bind_addr, &cfg, &server), WN_OK);
+    ASSERT_EQ(wn_client_create(&cfg, &client), WN_OK);
+
+    wn_peer_id_t client_peer;
+    ASSERT_EQ(wn_connect(client, &bind_addr, &client_peer), WN_OK);
+    wn_event_t ev;
+    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 5000));
+    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 5000));
+
+    /* Send everything without polling the server, so its queue fills up. */
+    uint8_t msg[R1_MSG_LEN];
+    for (int i = 0; i < R1_MSGS; i++) {
+        memset(msg, i, sizeof(msg));
+        ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
+                          msg, sizeof(msg)), WN_OK);
+    }
+    usleep(500 * 1000);
+
+    /* Drain and each message must arrive with its own payload, in send order */
+    for (int i = 0; i < R1_MSGS; i++) {
+        ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 10000));
+        ASSERT_EQ(ev.data_len, R1_MSG_LEN);
+        ASSERT_EQ(ev.data[0], (uint8_t)i);
+    }
+
+    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
+}
+
 /* ---- server-side channel clamp (H2) ---- */
 #define H2_CLUSTER_PORT 34972
 
@@ -1891,6 +1934,7 @@ int main(void) {
     RUN_TEST(test_pending_eviction_protects_live_handshake);
     RUN_TEST(test_event_queue_cap_bounds_hostile_flood);
     RUN_TEST(test_event_queue_cap_legit_traffic_flows);
+    RUN_TEST(test_reliable_ordered_survives_full_event_queue);
     RUN_TEST(test_server_clamps_negotiated_channel_count);
     RUN_TEST(test_udp_flood_does_not_starve_connection_ticks);
     TEST_SUMMARY();

@@ -68,8 +68,12 @@ typedef struct {
     uint32_t      reassembly_byte_budget;
 } wn_lane_t;
 
+typedef bool (*wn_channel_accept_fn)(void *ctx, uint32_t len);
+
 typedef struct {
     wn_lane_t lanes[WN_LANES_PER_CHANNEL];
+    wn_channel_accept_fn accept;
+    void *accept_ctx;
 } wn_channel_t;
 
 void wn_channel_init(wn_channel_t *chan);
