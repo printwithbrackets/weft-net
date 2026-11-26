@@ -860,7 +860,7 @@ static void ep_on_connected(void *ctx, wn_peer_id_t peer) {
  * under queue_lock so the answer matches what push_event would decide. */
 
 /* Must match the rule in push_event(), and change both together. */
-static bool ep_can_accept(voic *ctx, uint32_t len) {
+static bool ep_can_accept(void *ctx, uint32_t len) {
     conn_ctx_t *c = (conn_ctx_t *)ctx;
     wn_endpoint_t *ep = c->ep;
     bool ok = true;
