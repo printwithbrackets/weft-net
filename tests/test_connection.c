@@ -207,6 +207,7 @@ static void harness_init(harness_t *h) {
     h->cb.on_data = h_on_data;
     h->cb.on_disconnected = h_on_disconnected;
     h->cb.send_wire = h_send_wire;
+    h->cb.can_accept = NULL;
     h->cb.ctx = h;
 }
 

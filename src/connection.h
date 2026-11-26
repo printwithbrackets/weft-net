@@ -99,11 +99,14 @@ typedef void (*wn_conn_send_wire_fn)(void *ctx, wn_peer_id_t peer, const uint8_t
  * itself connected -- having sent CONNECT_RESPONSE only means it HOPES
  * the server accepted, not that it has confirmed it did. */
 typedef void (*wn_conn_connected_fn)(void *ctx, wn_peer_id_t peer);
+typedef bool (*wn_conn_accept_fn)(void *ctx, uint32_t len);
 
 typedef struct {
     wn_conn_deliver_event_fn on_data;
     wn_conn_disconnected_fn  on_disconnected;
     wn_conn_send_wire_fn     send_wire; /* actually put bytes on the socket */
+
+    wn_conn_accept_fn        can_accept;
     wn_conn_connected_fn     on_connected; /* may be NULL (server side doesn't need it) */
     void *ctx;
 } wn_conn_callbacks_t;

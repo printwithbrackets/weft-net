@@ -747,6 +747,8 @@ wn_result_t wn_connection_on_packet(wn_connection_t *conn, uint8_t type,
             uint32_t newly_acked = 0;
             uint16_t peer_rwnd = 0; /* header pre-checked above: always written */
             uint16_t adv = wn_connection_adv_window(conn);
+            conn->channels[channel_id].accept = cb->can_accept;
+            conn->channels[channel_id].accept_ctx = cb->ctx;
 
             wn_channel_on_receive(&conn->channels[channel_id], now_ms, plaintext, (uint16_t)ct_len,
                                    adv, on_channel_deliver, &dctx,

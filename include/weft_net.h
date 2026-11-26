@@ -269,7 +269,10 @@ typedef struct {
      * UNLIMITED restores the effectively unbounded queue of 1.1.x
      * explicitly. Note events other than WN_EVENT_DATA carry a zero
      * payload length and fit freely, but under a full queue they are
-     * rejected like any other event until the queue drains below the cap. */
+     * rejected like any other event until the queue drains below the cap. 
+     * Reliable fragmented messages need WN_MAX_MESSAGES_SIZE free, and ordered
+     * messsages released after a gap can still be lost when the queue is full. */
+
     uint32_t       event_queue_max_bytes;
     /* Capability bits advertised in the handshake (0 = WN_CAP_DEFAULT).
      * WN_CAP_FLOW_CONTROL is always forced on. */
