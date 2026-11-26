@@ -867,7 +867,7 @@ static bool ep_can_accept(void *ctx, uint32_t len) {
     pthread_mutex_lock(&ep->queue_lock);
     if (ep->event_queue_cap != WN_EVENT_QUEUE_UNLIMITED &&
         ep->event_queue_bytes + (uint64_t)len > (uint64_t)ep->event_queue_cap) {
-        ok = false
+        ok = false;
     }
     pthread_mutex_unlock(&ep->queue_lock);
     return ok;
