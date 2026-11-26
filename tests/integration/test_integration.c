@@ -1486,7 +1486,7 @@ TEST(test_reliable_ordered_survives_full_event_queue) {
     }
 
     wn_endpoint_destroy(client);
-    wn_endpoint_destroy(client);
+    wn_endpoint_destroy(server);
 }
 
 /* ---- server-side channel clamp (H2) ---- */
