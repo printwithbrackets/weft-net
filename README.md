@@ -397,9 +397,10 @@ genuinely valuable contribution.
   typical game server or general-purpose service needs; a sharded lock
   or RCU-style scheme would remove the bottleneck for very high
   connection counts.
-- **No connection migration.** If a client's address changes mid-connection
-  (e.g. a NAT rebind or network switch), the connection times out rather
-  than following the new address, unlike e.g. QUIC.
+- **Connection migration applies to UDP only.** WebSocket connections are
+  bound to their TCP link and do not migrate. After a migration the RTT
+  estimate keeps its old-path samples until new ones arrive, and congestion
+  state is not reset.
 - **WebRTC** is not implemented (see Features). WebSocket transport is
   implemented but currently binds a fixed path (`/`) and does not
   advertise LAN discovery over the WebSocket endpoint.
@@ -411,7 +412,7 @@ genuinely valuable contribution.
 
 An external review of this project suggested a substantial list of
 additions to move weft-net from "capable UDP library" toward something
-closer to a full modern transport (connection migration, an RPC layer,
+closer to a full modern transport (an RPC layer,
 built-in serialization, compression, and more -- plus infrastructure
 like CMake, fuzzing, and multi-OS CI). It's good feedback and most of it
 is a genuine gap, not a nitpick. Implementing all of it to the same
@@ -423,17 +424,14 @@ flow control, per-connection rate limiting, priority/QoS, capability
 negotiation) have been implemented and tested. What's left, roughly in
 priority order:
 
-1. **Connection migration** -- `PATH_CHALLENGE`/`PATH_RESPONSE` so a
-   client changing networks (mobile Wi-Fi <-> cellular, NAT rebind)
-   doesn't need a full reconnect, QUIC-style.
-2. **Expanded/range-based ACKs** -- the current 64-bit ack bitmap works
+1. **Expanded/range-based ACKs** -- the current 64-bit ack bitmap works
    well for the loss patterns tested above, but it also caps a connection
    at 64 reliable packets in flight, so explicit ranges would help on very
    high-latency/lossy links.
-3. **An optional RPC layer** with request/response semantics, and
+2. **An optional RPC layer** with request/response semantics, and
    **built-in (optional, separate-from-core) serialization**.
-4. **Compression** (compress-then-encrypt, never the reverse).
-5. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
+3. **Compression** (compress-then-encrypt, never the reverse).
+4. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
    Makefile, fuzzing (libFuzzer/AFL++) on the
    packet-parsing paths, Windows/macOS/Go/Rust CI, and benchmarks.
 
@@ -926,6 +924,22 @@ negotiation -- each with regression tests.
   `WN_CAP_RATE_LIMIT`); both sides store the intersection and expose it
   via `wn_peer_capabilities`. `WN_CAP_FLOW_CONTROL` is always forced on.
   Wire sizes: REQUEST 64 → 68 bytes, CHALLENGE 67 → 69.
+- **Connection migration (`WN_CAP_MIGRATION`).** When a peer's source address
+  changes mid-session (a NAT rebind, or a switch from Wi-Fi to cellular), the
+  connection follows the new address without reconnecting. The new address is
+  validated before any traffic moves. The server sends an encrypted
+  `WN_PKT_PATH_CHALLENGE` to the new address, and the peer has to echo the
+  token back in a `WN_PKT_PATH_RESPONSE` sent from that address. Until then,
+  data continues to the old address. Bytes sent to an unvalidated address are
+  capped at 3x the bytes received from it, so a forged source address cannot
+  direct traffic at a third party. A new address only starts validation after
+  an authenticated packet arrives from it, so an attacker without the session
+  key cannot trigger a move. The challenge is retransmitted every 500 ms and
+  abandoned after 5 s without a reply. Both peers must advertise the bit for
+  migration to run, so a peer that does not support it never sees the new
+  packets. The feature is on by default. Clear `WN_CAP_MIGRATION` in
+  `wn_config_t.capabilities` to turn it off. The packet types are new codes
+  rather than a protocol version bump.
 - **Standalone ACKs (protocol v3).** New encrypted `WN_PKT_ACK` packet so
   reliable traffic flowing one way (client → server with no reverse
   application data) still gets acks without waiting for a piggyback

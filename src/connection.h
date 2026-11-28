@@ -93,6 +93,11 @@ typedef bool (*wn_conn_deliver_event_fn)(void *ctx, wn_peer_id_t peer, uint8_t c
                                           wn_delivery_t delivery, const uint8_t *data, uint32_t len);
 typedef void (*wn_conn_disconnected_fn)(void *ctx, wn_peer_id_t peer, wn_result_t reason);
 typedef void (*wn_conn_send_wire_fn)(void *ctx, wn_peer_id_t peer, const uint8_t *packet, size_t len);
+/* Like send_wire, but to an explicit address instead of the connection's
+ * current one. Used for path challenges and responses during migration. */
+typedef void (*wn_conn_send_wire_to_fn)(void *ctx, wn_peer_id_t peer,
+                                        const struct sockaddr_storage *addr, socklen_t addr_len,
+                                        const uint8_t *packet, size_t len);
 /* Client-side only: fired exactly once, the first time the handshake is
  * confirmed end-to-end (this connection successfully decrypted a
  * CONNECT_ACCEPTED). Until this fires, the client shouldn't consider
@@ -105,6 +110,7 @@ typedef struct {
     wn_conn_deliver_event_fn on_data;
     wn_conn_disconnected_fn  on_disconnected;
     wn_conn_send_wire_fn     send_wire; /* actually put bytes on the socket */
+    wn_conn_send_wire_to_fn  send_wire_to; /* as send_wire, to a given address; may be NULL (migration off) */
 
     wn_conn_accept_fn        can_accept;
     wn_conn_connected_fn     on_connected; /* may be NULL (server side doesn't need it) */
@@ -197,6 +203,19 @@ typedef struct wn_connection {
     /* Negotiated handshake capabilities (AND of both peers' advertised sets). */
     uint32_t capabilities;
 
+    /* Connection migration (WN_CAP_MIGRATION). An authenticated packet from
+     * a new address starts a path check: a PATH_CHALLENGE goes to that
+     * address, and sends move there only after a matching PATH_RESPONSE.
+     * Until then, bytes sent to it are capped at 3x the bytes received. */
+    bool                    path_pending;
+    struct sockaddr_storage path_addr;
+    socklen_t               path_addr_len;
+    uint8_t                 path_token[8];
+    uint64_t                path_started_ms;
+    uint64_t                path_next_challenge_ms;
+    uint64_t                path_bytes_sent;
+    uint64_t                path_bytes_received;
+
     bool handshake_confirmed; /* client-side: has CONNECT_ACCEPTED been seen yet */
     /* Server-side: CONNECT_ACCEPTED retransmission bookkeeping. The client
      * may silently drop the single ACCEPTED datagram; until it confirms by
@@ -235,6 +254,14 @@ wn_result_t wn_connection_on_packet(wn_connection_t *conn, uint8_t type,
 /* Run retransmission scanning, idle-keepalive, and timeout checks. May
  * invoke cb->on_disconnected if the connection has timed out. Thread-safe. */
 void wn_connection_tick(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb);
+
+/* As wn_connection_on_packet, but also passes the datagram's source address,
+ * which enables connection migration. `from` may be NULL (for example for
+ * WebSocket-carried packets), which disables migration for that packet. */
+wn_result_t wn_connection_on_packet_from(wn_connection_t *conn, uint8_t type,
+                                         const uint8_t *enc_body, size_t enc_body_len,
+                                         uint64_t now_ms, const wn_conn_callbacks_t *cb,
+                                         const struct sockaddr_storage *from, socklen_t from_len);
 
 /* Flush any lanes with a pending receive ack (ack_dirty) as standalone
  * WN_PKT_ACK packets. Called by the endpoint after draining the socket

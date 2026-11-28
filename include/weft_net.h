@@ -113,8 +113,13 @@ extern "C" {
 /* Bit 2: peer applies a sender-side rate limit when configured (reserved
  * for cross-implementation signalling; enforcement is always local). */
 #define WN_CAP_RATE_LIMIT    0x00000004u
+/* Bit 3: connection migration. When both peers set this, a peer whose
+ * address changes mid-session (NAT rebinding, Wi-Fi to cellular) keeps its
+ * connection: traffic moves to the new address only after it answers a
+ * path challenge. Clearing this bit in a config turns migration off. */
+#define WN_CAP_MIGRATION     0x00000008u
 /* Default advertised set. WN_CAP_FLOW_CONTROL is always forced on. */
-#define WN_CAP_DEFAULT (WN_CAP_FLOW_CONTROL | WN_CAP_PRIORITY | WN_CAP_RATE_LIMIT)
+#define WN_CAP_DEFAULT (WN_CAP_FLOW_CONTROL | WN_CAP_PRIORITY | WN_CAP_RATE_LIMIT | WN_CAP_MIGRATION)
 
 /* ----------------------------------------------------------------------- */
 /* Send priorities (wn_send_ex; wn_send uses WN_PRIORITY_NORMAL)           */

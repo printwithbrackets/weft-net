@@ -806,6 +806,13 @@ static void ep_send_wire(void *ctx, wn_peer_id_t peer, const uint8_t *packet, si
     ep_send_wn(c->ep, &c->conn->addr, c->conn->addr_len, packet, len);
 }
 
+static void ep_send_wire_to(void *ctx, wn_peer_id_t peer, const struct sockaddr_storage *addr,
+                            socklen_t addr_len, const uint8_t *packet, size_t len) {
+    (void)peer;
+    conn_ctx_t *c = (conn_ctx_t *)ctx;
+    ep_send_wn(c->ep, addr, addr_len, packet, len);
+}
+
 static bool ep_on_data(void *ctx, wn_peer_id_t peer, uint8_t channel, wn_delivery_t delivery,
                         const uint8_t *data, uint32_t len) {
     (void)delivery;
@@ -879,6 +886,7 @@ static wn_conn_callbacks_t make_callbacks(conn_ctx_t *cctx) {
     cb.can_accept = ep_can_accept;
     cb.on_disconnected = ep_on_disconnected;
     cb.send_wire = ep_send_wire;
+    cb.send_wire_to = ep_send_wire_to;
     cb.on_connected = ep_on_connected;
     cb.ctx = cctx;
     return cb;
@@ -1617,7 +1625,8 @@ static void process_discovery_packet(wn_endpoint_t *ep, const uint8_t *buf, size
 /* ---- main packet dispatch ---- */
 
 static void process_main_packet(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
-                                 const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
+                                 const struct sockaddr_storage *from, socklen_t from_len, uint64_t now,
+                                 bool udp) {
     if (len < 1) return;
     uint8_t type = buf[0];
     switch (type) {
@@ -1637,6 +1646,8 @@ static void process_main_packet(wn_endpoint_t *ep, const uint8_t *buf, size_t le
         case WN_PKT_ACK:
         case WN_PKT_KEEPALIVE:
         case WN_PKT_DISCONNECT:
+        case WN_PKT_PATH_CHALLENGE:
+        case WN_PKT_PATH_RESPONSE:
         case WN_PKT_CONNECT_ACCEPTED: {
             if (len < 1 + 8) return;
             uint64_t connid = wn_get_u64(buf + 1);
@@ -1645,7 +1656,9 @@ static void process_main_packet(wn_endpoint_t *ep, const uint8_t *buf, size_t le
             if (conn) {
                 conn_ctx_t cctx = { ep, conn };
                 wn_conn_callbacks_t cb = make_callbacks(&cctx);
-                wn_connection_on_packet(conn, type, buf + 1, len - 1, now, &cb);
+                /* Only UDP datagrams carry a source address that migration can use. */
+                wn_connection_on_packet_from(conn, type, buf + 1, len - 1, now, &cb,
+                                             udp ? from : NULL, from_len);
             }
             pthread_mutex_unlock(&ep->connections_lock);
             break;
@@ -1722,7 +1735,7 @@ static bool ws_handle_message(wn_endpoint_t *ep, ws_link_t *link, uint8_t opcode
         return false;
     }
     if (opcode != WN_WS_OPCODE_BINARY && opcode != WN_WS_OPCODE_TEXT) return false;
-    process_main_packet(ep, msg, len, &link->addr, link->addr_len, now);
+    process_main_packet(ep, msg, len, &link->addr, link->addr_len, now, false);
     return true;
 }
 
@@ -1974,7 +1987,7 @@ static void *io_thread_main(void *arg) {
                     memset(&from, 0, sizeof(from));
                     ssize_t n = recvfrom(ep->sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
                     if (n <= 0) break;
-                    process_main_packet(ep, buf, (size_t)n, &from, from_len, now);
+                    process_main_packet(ep, buf, (size_t)n, &from, from_len, now, true);
                     got_packets = true;
                 }
             }

@@ -40,6 +40,8 @@ typedef enum {
     WN_PKT_ACK               = 0x09, /* encrypted */
     WN_PKT_DISCOVERY_REQUEST = 0x0A,
     WN_PKT_DISCOVERY_RESPONSE= 0x0B,
+    WN_PKT_PATH_CHALLENGE    = 0x0C, /* encrypted: 8-byte token; connection migration */
+    WN_PKT_PATH_RESPONSE     = 0x0D, /* encrypted: echoes the challenge token */
 } wn_packet_type_t;
 
 /* ---- Handshake packets (cleartext; authenticity comes from the cookie

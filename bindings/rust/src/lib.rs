@@ -193,6 +193,7 @@ pub mod caps {
     pub const FLOW_CONTROL: u32 = 0x0000_0001;
     pub const PRIORITY: u32 = 0x0000_0002;
     pub const RATE_LIMIT: u32 = 0x0000_0004;
+    pub const MIGRATION: u32 = 0x0000_0008;
 }
 
 /// Snapshot of per-peer counters and RTT estimates (`wn_peer_stats`).
