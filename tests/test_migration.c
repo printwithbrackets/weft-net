@@ -328,38 +328,168 @@ TEST(test_migration_disabled_when_capability_not_negotiated) {
     pair_free(&p);
 }
 
+TEST(test_packets_without_udp_source_cannot_migrate) {
+    pair_t p;
+    pair_init(&p);
+
+    send_data(&p, &p.client, "data without a UDP source");
+    ASSERT_EQ(p.client.out_count, 1);
+    const outmsg_t *data = &p.client.out[0];
+    ASSERT_EQ(wn_connection_on_packet(p.server.conn, data->pkt[0], data->pkt + 1,
+                                     data->len - 1, p.now, &p.server.cb), WN_OK);
+    p.client.out_count = 0;
+    ASSERT_EQ(p.server.data_count, 1);
+    ASSERT_FALSE(p.server.conn->path_pending);
+
+    client_moves_and_sends(&p);
+    pump(&p.server, &p.client, p.now);
+    int idx = find_out(&p.client, WN_PKT_PATH_RESPONSE, 6000);
+    ASSERT_TRUE(idx >= 0);
+    const outmsg_t *response = &p.client.out[idx];
+    ASSERT_EQ(wn_connection_on_packet(p.server.conn, response->pkt[0], response->pkt + 1,
+                                     response->len - 1, p.now, &p.server.cb),
+              WN_ERR_PROTOCOL_MISMATCH);
+    ASSERT_TRUE(p.server.conn->path_pending);
+    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
+    pair_free(&p);
+}
+
+TEST(test_challenge_is_rejected_without_negotiated_migration) {
+    pair_t p;
+    pair_init(&p);
+    client_moves_and_sends(&p);
+
+    int idx = find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002);
+    ASSERT_TRUE(idx >= 0);
+    const outmsg_t *challenge = &p.server.out[idx];
+    p.client.conn->capabilities &= ~WN_CAP_MIGRATION;
+    ASSERT_EQ(wn_connection_on_packet_from(p.client.conn, challenge->pkt[0], challenge->pkt + 1,
+                                          challenge->len - 1, p.now, &p.client.cb,
+                                          &p.server.own, p.server.own_len),
+              WN_ERR_PROTOCOL_MISMATCH);
+    ASSERT_EQ(p.client.out_count, 0);
+    ASSERT_FALSE(p.client.conn->path_pending);
+    pair_free(&p);
+}
+
+TEST(test_lost_challenge_can_be_retried_and_validate_the_path) {
+    pair_t p;
+    pair_init(&p);
+    client_moves_and_sends(&p);
+    ASSERT_TRUE(find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002) >= 0);
+    p.server.out_count = 0; /* Drop the first challenge. */
+
+    wn_connection_tick(p.server.conn, p.now + 499, &p.server.cb);
+    ASSERT_TRUE(find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002) < 0);
+    p.now += 500;
+    wn_connection_tick(p.server.conn, p.now, &p.server.cb);
+    ASSERT_TRUE(find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002) >= 0);
+    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
+
+    settle(&p);
+    ASSERT_FALSE(p.server.conn->path_pending);
+    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5002));
+    pair_free(&p);
+}
+
+TEST(test_ipv6_address_change_without_port_change_validates) {
+    pair_t p;
+    pair_init(&p);
+
+    /* Give the client an IPv6 source address known to the server, then change
+     * only the IP. The simulated link does not need IPv6 socket support. */
+    struct sockaddr_in6 *client_addr = (struct sockaddr_in6 *)&p.client.own;
+    memset(&p.client.own, 0, sizeof(p.client.own));
+    client_addr->sin6_family = AF_INET6;
+    client_addr->sin6_port = htons(5001);
+    ASSERT_EQ(inet_pton(AF_INET6, "2001:db8::1", &client_addr->sin6_addr), 1);
+    p.client.own_len = sizeof(*client_addr);
+    p.server.conn->addr = p.client.own;
+    p.server.conn->addr_len = p.client.own_len;
+
+    send_data(&p, &p.client, "original IPv6 address");
+    settle(&p);
+    ASSERT_FALSE(p.server.conn->path_pending);
+
+    ASSERT_EQ(inet_pton(AF_INET6, "2001:db8::2", &client_addr->sin6_addr), 1);
+    send_data(&p, &p.client, "new IPv6 address");
+    ASSERT_EQ(pump(&p.client, &p.server, p.now), 1);
+    ASSERT_TRUE(p.server.conn->path_pending);
+    settle(&p);
+    ASSERT_FALSE(p.server.conn->path_pending);
+
+    const char reply[] = "reply to new IPv6 address";
+    send_data(&p, &p.server, reply);
+    settle(&p);
+    ASSERT_EQ(p.client.data_count, 1);
+    ASSERT_EQ(p.client.last_data_len, sizeof(reply) - 1);
+    ASSERT_MEM_EQ(p.client.last_data, reply, sizeof(reply) - 1);
+    pair_free(&p);
+}
+
+static size_t bytes_to_port(const side_t *side, uint16_t port) {
+    size_t total = 0;
+    for (int i = 0; i < side->out_count; i++) {
+        if (addr_is(&side->out[i].dest, port)) total += side->out[i].len;
+    }
+    return total;
+}
+
 TEST(test_amplification_budget_limits_bytes_to_unvalidated_address) {
     pair_t p;
     pair_init(&p);
 
-    client_moves_and_sends(&p);
-    uint32_t trigger_bytes = p.server.conn->path_bytes_received;
-    ASSERT_TRUE(trigger_bytes > 0);
+    addr4(&p.client.own, &p.client.own_len, 5002);
+    send_data(&p, &p.client, "probe trigger");
+    ASSERT_EQ(p.client.out_count, 1);
+    size_t received = p.client.out[0].len;
+    ASSERT_EQ(pump(&p.client, &p.server, p.now), 1);
+    size_t sent = bytes_to_port(&p.server, 5002);
+    ASSERT_TRUE(sent > 0);
+    p.server.out_count = 0;
 
     /* The client never answers. Keep ticking the server for longer than the
      * retransmit interval, discarding everything it sends. */
     for (int i = 0; i < 40; i++) {
         p.now += 100;
         wn_connection_tick(p.server.conn, p.now, &p.server.cb);
+        sent += bytes_to_port(&p.server, 5002);
         p.server.out_count = 0;
     }
 
-    ASSERT_TRUE(p.server.conn->path_bytes_sent <= 3 * p.server.conn->path_bytes_received);
-    ASSERT_TRUE(p.server.conn->path_bytes_sent > 0);
+    ASSERT_TRUE(p.server.conn->path_pending);
+    ASSERT_TRUE(sent <= 3 * received);
+    ASSERT_EQ(p.server.out_overflow, 0);
+
+    /* Fresh traffic on the candidate path gives the server room to retry. */
+    send_data(&p, &p.client, "fresh traffic");
+    ASSERT_EQ(p.client.out_count, 1);
+    received += p.client.out[0].len;
+    ASSERT_EQ(pump(&p.client, &p.server, p.now), 1);
+    ASSERT_TRUE(find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002) >= 0);
+    ASSERT_TRUE(sent + bytes_to_port(&p.server, 5002) <= 3 * received);
     pair_free(&p);
 }
 
-TEST(test_unanswered_challenge_is_abandoned_after_timeout) {
+TEST(test_response_arriving_after_validation_timeout_cannot_move_connection) {
     pair_t p;
     pair_init(&p);
 
     client_moves_and_sends(&p);
-    for (int i = 0; i < 80; i++) {
-        p.now += 100;
-        wn_connection_tick(p.server.conn, p.now, &p.server.cb);
-        p.server.out_count = 0;
-    }
+    pump(&p.server, &p.client, p.now); /* Hold the genuine response in flight. */
+    int idx = find_out(&p.client, WN_PKT_PATH_RESPONSE, 6000);
+    ASSERT_TRUE(idx >= 0);
+    const outmsg_t *response = &p.client.out[idx];
 
+    wn_connection_tick(p.server.conn, p.now + 4999, &p.server.cb);
+    ASSERT_TRUE(p.server.conn->path_pending);
+    p.now += 5000;
+    wn_connection_tick(p.server.conn, p.now, &p.server.cb);
+    ASSERT_FALSE(p.server.conn->path_pending);
+
+    ASSERT_EQ(wn_connection_on_packet_from(p.server.conn, response->pkt[0], response->pkt + 1,
+                                          response->len - 1, p.now, &p.server.cb,
+                                          &p.client.own, p.client.own_len), WN_OK);
     ASSERT_FALSE(p.server.conn->path_pending);
     ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
     pair_free(&p);
@@ -392,8 +522,12 @@ int main(void) {
     RUN_TEST(test_path_response_from_unexpected_address_is_ignored);
     RUN_TEST(test_unauthenticated_packet_from_new_address_triggers_nothing);
     RUN_TEST(test_migration_disabled_when_capability_not_negotiated);
+    RUN_TEST(test_packets_without_udp_source_cannot_migrate);
+    RUN_TEST(test_challenge_is_rejected_without_negotiated_migration);
+    RUN_TEST(test_lost_challenge_can_be_retried_and_validate_the_path);
+    RUN_TEST(test_ipv6_address_change_without_port_change_validates);
     RUN_TEST(test_amplification_budget_limits_bytes_to_unvalidated_address);
-    RUN_TEST(test_unanswered_challenge_is_abandoned_after_timeout);
+    RUN_TEST(test_response_arriving_after_validation_timeout_cannot_move_connection);
     RUN_TEST(test_reliable_messages_arrive_in_order_across_migration);
     TEST_SUMMARY();
     return 0;
