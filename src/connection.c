@@ -313,8 +313,9 @@ void wn_connection_destroy(wn_connection_t *conn) {
 
 /* ---- encryption plumbing (caller must hold conn->lock) ---- */
 
-static void encrypt_and_emit(wn_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
-                              bool is_retransmit, const wn_conn_callbacks_t *cb) {
+static void encrypt_and_emit_to(wn_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
+                                bool is_retransmit, const struct sockaddr_storage *dest, socklen_t dest_len,
+                                const wn_conn_callbacks_t *cb) {
     uint8_t packet[WN_ENCRYPTED_PACKET_SCRATCH];
     size_t off = 0;
     packet[off++] = type;
@@ -338,13 +339,123 @@ static void encrypt_and_emit(wn_connection_t *conn, uint8_t type, const uint8_t 
     conn->stats.bytes_sent += off;
     if (is_retransmit) conn->stats.retransmits++;
 
-    cb->send_wire(cb->ctx, conn->id, packet, off);
+    if (dest) {
+        cb->send_wire_to(cb->ctx, conn->id, dest, dest_len, packet, off);
+    } else {
+        cb->send_wire(cb->ctx, conn->id, packet, off);
+    }
+}
+
+static void encrypt_and_emit(wn_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
+                              bool is_retransmit, const wn_conn_callbacks_t *cb) {
+    encrypt_and_emit_to(conn, type, plaintext, pt_len, is_retransmit, NULL, 0, cb);
 }
 
 typedef struct {
     wn_connection_t *conn;
     const wn_conn_callbacks_t *cb;
 } emit_ctx_t;
+
+/* ---- connection migration ----
+ *
+ * A datagram that authenticates from an address other than conn->addr does
+ * not move the connection by itself. The connection sends a PATH_CHALLENGE
+ * to the new address, and moves only when a PATH_RESPONSE echoing the token
+ * comes back from that same address. Until validation completes, bytes sent
+ * to the unvalidated address stay within 3x the bytes received from it, so a
+ * forged source address cannot aim this side's traffic at a victim. */
+
+#define WN_PATH_TOKEN_SIZE      8
+/* 8-byte header (type, connection id, counter) is 17 bytes, plus token and tag. */
+#define WN_PATH_PACKET_SIZE     (17 + WN_PATH_TOKEN_SIZE + WN_GCM_TAG_SIZE)
+#define WN_PATH_BUDGET_FACTOR   3
+#define WN_PATH_RETRANSMIT_MS   500
+#define WN_PATH_TIMEOUT_MS      5000
+
+static bool path_same_addr(const struct sockaddr_storage *a, socklen_t a_len,
+                           const struct sockaddr_storage *b, socklen_t b_len) {
+    if (a->ss_family != b->ss_family || a_len != b_len) return false;
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *x = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *y = (const struct sockaddr_in *)b;
+        return x->sin_port == y->sin_port && x->sin_addr.s_addr == y->sin_addr.s_addr;
+    }
+    if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)b;
+        return x->sin6_port == y->sin6_port && memcmp(&x->sin6_addr, &y->sin6_addr, 16) == 0;
+    }
+    return memcmp(a, b, a_len) == 0;
+}
+
+static void path_send_probe(wn_connection_t *conn, uint8_t type, const uint8_t *token,
+                            const struct sockaddr_storage *dest, socklen_t dest_len,
+                            const wn_conn_callbacks_t *cb) {
+    encrypt_and_emit_to(conn, type, token, WN_PATH_TOKEN_SIZE, false, dest, dest_len, cb);
+}
+
+/* Send the pending challenge if the retransmit timer is due and the
+ * amplification budget has room for one more packet. */
+static void path_try_challenge(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
+    if (!cb->send_wire_to) return;
+    if (now_ms < conn->path_next_challenge_ms) return;
+    if (conn->path_bytes_sent + WN_PATH_PACKET_SIZE > (uint64_t)WN_PATH_BUDGET_FACTOR * conn->path_bytes_received) {
+        return;
+    }
+    path_send_probe(conn, WN_PKT_PATH_CHALLENGE, conn->path_token, &conn->path_addr, conn->path_addr_len, cb);
+    conn->path_bytes_sent += WN_PATH_PACKET_SIZE;
+    conn->path_next_challenge_ms = now_ms + WN_PATH_RETRANSMIT_MS;
+}
+
+/* Called for every authenticated packet on a migration-capable connection.
+ * Packets from the current address need no action. Packets from another
+ * address start, or continue, validation of that address. */
+static void path_observe_authenticated(wn_connection_t *conn, const struct sockaddr_storage *from,
+                                       socklen_t from_len, size_t pkt_len, uint64_t now_ms,
+                                       const wn_conn_callbacks_t *cb) {
+    if (path_same_addr(from, from_len, &conn->addr, conn->addr_len)) return;
+    if (!conn->path_pending || !path_same_addr(from, from_len, &conn->path_addr, conn->path_addr_len)) {
+        conn->path_pending = true;
+        conn->path_addr = *from;
+        conn->path_addr_len = from_len;
+        wn_crypto_random(conn->path_token, WN_PATH_TOKEN_SIZE);
+        conn->path_started_ms = now_ms;
+        conn->path_next_challenge_ms = 0; /* challenge right away */
+        conn->path_bytes_sent = 0;
+        conn->path_bytes_received = 0;
+    }
+    conn->path_bytes_received += pkt_len;
+    path_try_challenge(conn, now_ms, cb);
+}
+
+/* Handles an authenticated PATH_CHALLENGE or PATH_RESPONSE. A challenge is
+ * answered at the address it came from. A response commits the move only
+ * when it comes from the address being validated and echoes its token. */
+static void path_handle_probe(wn_connection_t *conn, uint8_t type, const uint8_t *token,
+                              const struct sockaddr_storage *from, socklen_t from_len,
+                              const wn_conn_callbacks_t *cb) {
+    if (type == WN_PKT_PATH_CHALLENGE) {
+        path_send_probe(conn, WN_PKT_PATH_RESPONSE, token, from, from_len, cb);
+        return;
+    }
+    if (!conn->path_pending) return;
+    if (!path_same_addr(from, from_len, &conn->path_addr, conn->path_addr_len)) return;
+    if (!wn_crypto_const_time_eq(token, conn->path_token, WN_PATH_TOKEN_SIZE)) return;
+    conn->addr = conn->path_addr;
+    conn->addr_len = conn->path_addr_len;
+    conn->path_pending = false;
+    conn->path_bytes_sent = 0;
+    conn->path_bytes_received = 0;
+}
+
+static void path_tick(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
+    if (!conn->path_pending) return;
+    if (now_ms - conn->path_started_ms >= WN_PATH_TIMEOUT_MS) {
+        conn->path_pending = false; /* unanswered: stay on the current address */
+        return;
+    }
+    path_try_challenge(conn, now_ms, cb);
+}
 
 static void on_channel_emit(void *ctx, const uint8_t *wire_payload, uint16_t len) {
     emit_ctx_t *e = (emit_ctx_t *)ctx;
@@ -669,6 +780,13 @@ static void on_channel_deliver(void *ctx, uint8_t channel_id, wn_delivery_t deli
 wn_result_t wn_connection_on_packet(wn_connection_t *conn, uint8_t type,
                                      const uint8_t *enc_body, size_t enc_body_len,
                                      uint64_t now_ms, const wn_conn_callbacks_t *cb) {
+    return wn_connection_on_packet_from(conn, type, enc_body, enc_body_len, now_ms, cb, NULL, 0);
+}
+
+wn_result_t wn_connection_on_packet_from(wn_connection_t *conn, uint8_t type,
+                                         const uint8_t *enc_body, size_t enc_body_len,
+                                         uint64_t now_ms, const wn_conn_callbacks_t *cb,
+                                         const struct sockaddr_storage *from, socklen_t from_len) {
     if (enc_body_len < 8 + 8 + WN_GCM_TAG_SIZE) return WN_ERR_PROTOCOL_MISMATCH;
 
     uint64_t counter = wn_get_u64(enc_body + 8);
@@ -720,6 +838,16 @@ wn_result_t wn_connection_on_packet(wn_connection_t *conn, uint8_t type,
     conn->last_recv_time_ms = now_ms;
     conn->stats.packets_received++;
     conn->stats.bytes_received += enc_body_len + 1; /* +1 for the type byte, passed separately */
+
+    if (type == WN_PKT_PATH_CHALLENGE || type == WN_PKT_PATH_RESPONSE) {
+        bool ok = from && (conn->capabilities & WN_CAP_MIGRATION) && ct_len == WN_PATH_TOKEN_SIZE;
+        if (ok) path_handle_probe(conn, type, plaintext, from, from_len, cb);
+        pthread_mutex_unlock(&conn->lock);
+        return ok ? WN_OK : WN_ERR_PROTOCOL_MISMATCH;
+    }
+    if (from && (conn->capabilities & WN_CAP_MIGRATION)) {
+        path_observe_authenticated(conn, from, from_len, (size_t)enc_body_len + 1, now_ms, cb);
+    }
 
     wn_result_t result = WN_OK;
     bool just_confirmed = false;
@@ -909,6 +1037,7 @@ void wn_connection_tick(wn_connection_t *conn, uint64_t now_ms, const wn_conn_ca
         pthread_mutex_unlock(&conn->lock);
         return;
     }
+    path_tick(conn, now_ms, cb);
 
     /* Idle timeout. */
     if (now_ms - conn->last_recv_time_ms > conn->connection_timeout_ms) {

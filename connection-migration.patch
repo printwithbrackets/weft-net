@@ -1,0 +1,1079 @@
+diff -ruN -x build -x __pycache__ weft/weft-net-main/Makefile mig/Makefile
+--- a/Makefile	2026-11-26 10:39:28.000000000 +0000
++++ b/Makefile	2026-11-28 10:08:51.468790642 +0000
+@@ -112,6 +112,7 @@
+ 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_network_simulation src/channel.c src/seqbuf.c src/fragment.c tests/test_network_simulation.c
+ 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_websocket src/websocket.c src/crypto.c tests/test_websocket.c $(CRYPTO_LIBS)
+ 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_framework tests/test_framework.c
++	$(CC) $(TEST_CFLAGS) -pthread -o $(TEST_BIN_DIR)/test_migration src/connection.c src/channel.c src/seqbuf.c src/fragment.c src/crypto.c tests/test_migration.c $(CRYPTO_LIBS)
+ 	@echo "--- running unit tests ---"
+ 	$(TEST_BIN_DIR)/test_seqbuf
+ 	$(TEST_BIN_DIR)/test_crypto
+@@ -121,6 +122,7 @@
+ 	$(TEST_BIN_DIR)/test_network_simulation
+ 	$(TEST_BIN_DIR)/test_websocket
+ 	$(TEST_BIN_DIR)/test_framework
++	$(TEST_BIN_DIR)/test_migration
+ 
+ test-integration: | $(BUILD_DIR)
+ 	mkdir -p $(TEST_BIN_DIR)
+@@ -128,10 +130,13 @@
+ 		$(SRC) tests/integration/test_integration.c $(CRYPTO_LIBS)
+ 	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -pthread -o $(TEST_BIN_DIR)/test_websocket_integration \
+ 		$(SRC) tests/integration/test_websocket_integration.c $(CRYPTO_LIBS)
++	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -pthread -o $(TEST_BIN_DIR)/test_migration_integration \
++		$(SRC) tests/integration/test_migration_integration.c $(CRYPTO_LIBS)
+ 	@echo "--- running integration tests (real sockets) ---"
+ 	$(TEST_BIN_DIR)/test_integration
+ 	@echo "--- running integration tests (websocket transport) ---"
+ 	$(TEST_BIN_DIR)/test_websocket_integration
++	$(TEST_BIN_DIR)/test_migration_integration
+ 
+ # --- concurrency tests ---
+ #
+diff -ruN -x build -x __pycache__ weft/weft-net-main/README.md mig/README.md
+--- a/README.md	2026-11-26 10:39:28.000000000 +0000
++++ b/README.md	2026-11-28 10:13:29.590396654 +0000
+@@ -397,9 +397,10 @@
+   typical game server or general-purpose service needs; a sharded lock
+   or RCU-style scheme would remove the bottleneck for very high
+   connection counts.
+-- **No connection migration.** If a client's address changes mid-connection
+-  (e.g. a NAT rebind or network switch), the connection times out rather
+-  than following the new address, unlike e.g. QUIC.
++- **Connection migration applies to UDP only.** WebSocket connections are
++  bound to their TCP link and do not migrate. After a migration the RTT
++  estimate keeps its old-path samples until new ones arrive, and congestion
++  state is not reset.
+ - **WebRTC** is not implemented (see Features). WebSocket transport is
+   implemented but currently binds a fixed path (`/`) and does not
+   advertise LAN discovery over the WebSocket endpoint.
+@@ -411,7 +412,7 @@
+ 
+ An external review of this project suggested a substantial list of
+ additions to move weft-net from "capable UDP library" toward something
+-closer to a full modern transport (connection migration, an RPC layer,
++closer to a full modern transport (an RPC layer,
+ built-in serialization, compression, and more -- plus infrastructure
+ like CMake, fuzzing, and multi-OS CI). It's good feedback and most of it
+ is a genuine gap, not a nitpick. Implementing all of it to the same
+@@ -423,17 +424,14 @@
+ negotiation) have been implemented and tested. What's left, roughly in
+ priority order:
+ 
+-1. **Connection migration** -- `PATH_CHALLENGE`/`PATH_RESPONSE` so a
+-   client changing networks (mobile Wi-Fi <-> cellular, NAT rebind)
+-   doesn't need a full reconnect, QUIC-style.
+-2. **Expanded/range-based ACKs** -- the current 64-bit ack bitmap works
++1. **Expanded/range-based ACKs** -- the current 64-bit ack bitmap works
+    well for the loss patterns tested above, but it also caps a connection
+    at 64 reliable packets in flight, so explicit ranges would help on very
+    high-latency/lossy links.
+-3. **An optional RPC layer** with request/response semantics, and
++2. **An optional RPC layer** with request/response semantics, and
+    **built-in (optional, separate-from-core) serialization**.
+-4. **Compression** (compress-then-encrypt, never the reverse).
+-5. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
++3. **Compression** (compress-then-encrypt, never the reverse).
++4. Smaller infrastructure: a C++ RAII wrapper, CMake alongside the
+    Makefile, fuzzing (libFuzzer/AFL++) on the
+    packet-parsing paths, Windows/macOS/Go/Rust CI, and benchmarks.
+ 
+@@ -926,6 +924,22 @@
+   `WN_CAP_RATE_LIMIT`); both sides store the intersection and expose it
+   via `wn_peer_capabilities`. `WN_CAP_FLOW_CONTROL` is always forced on.
+   Wire sizes: REQUEST 64 → 68 bytes, CHALLENGE 67 → 69.
++- **Connection migration (`WN_CAP_MIGRATION`).** When a peer's source address
++  changes mid-session (a NAT rebind, or a switch from Wi-Fi to cellular), the
++  connection follows the new address without reconnecting. The new address is
++  validated before any traffic moves. The server sends an encrypted
++  `WN_PKT_PATH_CHALLENGE` to the new address, and the peer has to echo the
++  token back in a `WN_PKT_PATH_RESPONSE` sent from that address. Until then,
++  data continues to the old address. Bytes sent to an unvalidated address are
++  capped at 3x the bytes received from it, so a forged source address cannot
++  direct traffic at a third party. A new address only starts validation after
++  an authenticated packet arrives from it, so an attacker without the session
++  key cannot trigger a move. The challenge is retransmitted every 500 ms and
++  abandoned after 5 s without a reply. Both peers must advertise the bit for
++  migration to run, so a peer that does not support it never sees the new
++  packets. The feature is on by default. Clear `WN_CAP_MIGRATION` in
++  `wn_config_t.capabilities` to turn it off. The packet types are new codes
++  rather than a protocol version bump.
+ - **Standalone ACKs (protocol v3).** New encrypted `WN_PKT_ACK` packet so
+   reliable traffic flowing one way (client → server with no reverse
+   application data) still gets acks without waiting for a piggyback
+diff -ruN -x build -x __pycache__ weft/weft-net-main/bindings/go/weftnet.go mig/bindings/go/weftnet.go
+--- a/bindings/go/weftnet.go	2026-11-26 10:39:28.000000000 +0000
++++ b/bindings/go/weftnet.go	2026-11-28 10:13:23.009792744 +0000
+@@ -65,6 +65,7 @@
+ 	CapFlowControl uint32 = 0x00000001
+ 	CapPriority    uint32 = 0x00000002
+ 	CapRateLimit   uint32 = 0x00000004
++	CapMigration   uint32 = 0x00000008
+ )
+ 
+ // PeerStats mirrors wn_peer_stats_t.
+diff -ruN -x build -x __pycache__ weft/weft-net-main/bindings/python/weft_net/__init__.py mig/bindings/python/weft_net/__init__.py
+--- a/bindings/python/weft_net/__init__.py	2026-11-26 10:39:28.000000000 +0000
++++ b/bindings/python/weft_net/__init__.py	2026-11-28 10:13:23.010623352 +0000
+@@ -55,6 +55,7 @@
+ CapFlowControl = 0x00000001
+ CapPriority = 0x00000002
+ CapRateLimit = 0x00000004
++CapMigration = 0x00000008
+ 
+ # --------------------------------------------------------------------------
+ # Library loading
+diff -ruN -x build -x __pycache__ weft/weft-net-main/bindings/rust/src/lib.rs mig/bindings/rust/src/lib.rs
+--- a/bindings/rust/src/lib.rs	2026-11-26 10:39:28.000000000 +0000
++++ b/bindings/rust/src/lib.rs	2026-11-28 10:13:23.011175210 +0000
+@@ -193,6 +193,7 @@
+     pub const FLOW_CONTROL: u32 = 0x0000_0001;
+     pub const PRIORITY: u32 = 0x0000_0002;
+     pub const RATE_LIMIT: u32 = 0x0000_0004;
++    pub const MIGRATION: u32 = 0x0000_0008;
+ }
+ 
+ /// Snapshot of per-peer counters and RTT estimates (`wn_peer_stats`).
+diff -ruN -x build -x __pycache__ weft/weft-net-main/include/weft_net.h mig/include/weft_net.h
+--- a/include/weft_net.h	2026-11-26 10:39:28.000000000 +0000
++++ b/include/weft_net.h	2026-11-28 10:06:25.507308191 +0000
+@@ -113,8 +113,13 @@
+ /* Bit 2: peer applies a sender-side rate limit when configured (reserved
+  * for cross-implementation signalling; enforcement is always local). */
+ #define WN_CAP_RATE_LIMIT    0x00000004u
++/* Bit 3: connection migration. When both peers set this, a peer whose
++ * address changes mid-session (NAT rebinding, Wi-Fi to cellular) keeps its
++ * connection: traffic moves to the new address only after it answers a
++ * path challenge. Clearing this bit in a config turns migration off. */
++#define WN_CAP_MIGRATION     0x00000008u
+ /* Default advertised set. WN_CAP_FLOW_CONTROL is always forced on. */
+-#define WN_CAP_DEFAULT (WN_CAP_FLOW_CONTROL | WN_CAP_PRIORITY | WN_CAP_RATE_LIMIT)
++#define WN_CAP_DEFAULT (WN_CAP_FLOW_CONTROL | WN_CAP_PRIORITY | WN_CAP_RATE_LIMIT | WN_CAP_MIGRATION)
+ 
+ /* ----------------------------------------------------------------------- */
+ /* Send priorities (wn_send_ex; wn_send uses WN_PRIORITY_NORMAL)           */
+diff -ruN -x build -x __pycache__ weft/weft-net-main/src/connection.c mig/src/connection.c
+--- a/src/connection.c	2026-11-26 10:39:28.000000000 +0000
++++ b/src/connection.c	2026-11-28 10:07:58.814675497 +0000
+@@ -313,8 +313,9 @@
+ 
+ /* ---- encryption plumbing (caller must hold conn->lock) ---- */
+ 
+-static void encrypt_and_emit(wn_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
+-                              bool is_retransmit, const wn_conn_callbacks_t *cb) {
++static void encrypt_and_emit_to(wn_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
++                                bool is_retransmit, const struct sockaddr_storage *dest, socklen_t dest_len,
++                                const wn_conn_callbacks_t *cb) {
+     uint8_t packet[WN_ENCRYPTED_PACKET_SCRATCH];
+     size_t off = 0;
+     packet[off++] = type;
+@@ -338,7 +339,16 @@
+     conn->stats.bytes_sent += off;
+     if (is_retransmit) conn->stats.retransmits++;
+ 
+-    cb->send_wire(cb->ctx, conn->id, packet, off);
++    if (dest) {
++        cb->send_wire_to(cb->ctx, conn->id, dest, dest_len, packet, off);
++    } else {
++        cb->send_wire(cb->ctx, conn->id, packet, off);
++    }
++}
++
++static void encrypt_and_emit(wn_connection_t *conn, uint8_t type, const uint8_t *plaintext, size_t pt_len,
++                              bool is_retransmit, const wn_conn_callbacks_t *cb) {
++    encrypt_and_emit_to(conn, type, plaintext, pt_len, is_retransmit, NULL, 0, cb);
+ }
+ 
+ typedef struct {
+@@ -346,6 +356,107 @@
+     const wn_conn_callbacks_t *cb;
+ } emit_ctx_t;
+ 
++/* ---- connection migration ----
++ *
++ * A datagram that authenticates from an address other than conn->addr does
++ * not move the connection by itself. The connection sends a PATH_CHALLENGE
++ * to the new address, and moves only when a PATH_RESPONSE echoing the token
++ * comes back from that same address. Until validation completes, bytes sent
++ * to the unvalidated address stay within 3x the bytes received from it, so a
++ * forged source address cannot aim this side's traffic at a victim. */
++
++#define WN_PATH_TOKEN_SIZE      8
++/* 8-byte header (type, connection id, counter) is 17 bytes, plus token and tag. */
++#define WN_PATH_PACKET_SIZE     (17 + WN_PATH_TOKEN_SIZE + WN_GCM_TAG_SIZE)
++#define WN_PATH_BUDGET_FACTOR   3
++#define WN_PATH_RETRANSMIT_MS   500
++#define WN_PATH_TIMEOUT_MS      5000
++
++static bool path_same_addr(const struct sockaddr_storage *a, socklen_t a_len,
++                           const struct sockaddr_storage *b, socklen_t b_len) {
++    if (a->ss_family != b->ss_family || a_len != b_len) return false;
++    if (a->ss_family == AF_INET) {
++        const struct sockaddr_in *x = (const struct sockaddr_in *)a;
++        const struct sockaddr_in *y = (const struct sockaddr_in *)b;
++        return x->sin_port == y->sin_port && x->sin_addr.s_addr == y->sin_addr.s_addr;
++    }
++    if (a->ss_family == AF_INET6) {
++        const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)a;
++        const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)b;
++        return x->sin6_port == y->sin6_port && memcmp(&x->sin6_addr, &y->sin6_addr, 16) == 0;
++    }
++    return memcmp(a, b, a_len) == 0;
++}
++
++static void path_send_probe(wn_connection_t *conn, uint8_t type, const uint8_t *token,
++                            const struct sockaddr_storage *dest, socklen_t dest_len,
++                            const wn_conn_callbacks_t *cb) {
++    encrypt_and_emit_to(conn, type, token, WN_PATH_TOKEN_SIZE, false, dest, dest_len, cb);
++}
++
++/* Send the pending challenge if the retransmit timer is due and the
++ * amplification budget has room for one more packet. */
++static void path_try_challenge(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
++    if (!cb->send_wire_to) return;
++    if (now_ms < conn->path_next_challenge_ms) return;
++    if (conn->path_bytes_sent + WN_PATH_PACKET_SIZE > (uint64_t)WN_PATH_BUDGET_FACTOR * conn->path_bytes_received) {
++        return;
++    }
++    path_send_probe(conn, WN_PKT_PATH_CHALLENGE, conn->path_token, &conn->path_addr, conn->path_addr_len, cb);
++    conn->path_bytes_sent += WN_PATH_PACKET_SIZE;
++    conn->path_next_challenge_ms = now_ms + WN_PATH_RETRANSMIT_MS;
++}
++
++/* Called for every authenticated packet on a migration-capable connection.
++ * Packets from the current address need no action. Packets from another
++ * address start, or continue, validation of that address. */
++static void path_observe_authenticated(wn_connection_t *conn, const struct sockaddr_storage *from,
++                                       socklen_t from_len, size_t pkt_len, uint64_t now_ms,
++                                       const wn_conn_callbacks_t *cb) {
++    if (path_same_addr(from, from_len, &conn->addr, conn->addr_len)) return;
++    if (!conn->path_pending || !path_same_addr(from, from_len, &conn->path_addr, conn->path_addr_len)) {
++        conn->path_pending = true;
++        conn->path_addr = *from;
++        conn->path_addr_len = from_len;
++        wn_crypto_random(conn->path_token, WN_PATH_TOKEN_SIZE);
++        conn->path_started_ms = now_ms;
++        conn->path_next_challenge_ms = 0; /* challenge right away */
++        conn->path_bytes_sent = 0;
++        conn->path_bytes_received = 0;
++    }
++    conn->path_bytes_received += pkt_len;
++    path_try_challenge(conn, now_ms, cb);
++}
++
++/* Handles an authenticated PATH_CHALLENGE or PATH_RESPONSE. A challenge is
++ * answered at the address it came from. A response commits the move only
++ * when it comes from the address being validated and echoes its token. */
++static void path_handle_probe(wn_connection_t *conn, uint8_t type, const uint8_t *token,
++                              const struct sockaddr_storage *from, socklen_t from_len,
++                              const wn_conn_callbacks_t *cb) {
++    if (type == WN_PKT_PATH_CHALLENGE) {
++        path_send_probe(conn, WN_PKT_PATH_RESPONSE, token, from, from_len, cb);
++        return;
++    }
++    if (!conn->path_pending) return;
++    if (!path_same_addr(from, from_len, &conn->path_addr, conn->path_addr_len)) return;
++    if (!wn_crypto_const_time_eq(token, conn->path_token, WN_PATH_TOKEN_SIZE)) return;
++    conn->addr = conn->path_addr;
++    conn->addr_len = conn->path_addr_len;
++    conn->path_pending = false;
++    conn->path_bytes_sent = 0;
++    conn->path_bytes_received = 0;
++}
++
++static void path_tick(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb) {
++    if (!conn->path_pending) return;
++    if (now_ms - conn->path_started_ms >= WN_PATH_TIMEOUT_MS) {
++        conn->path_pending = false; /* unanswered: stay on the current address */
++        return;
++    }
++    path_try_challenge(conn, now_ms, cb);
++}
++
+ static void on_channel_emit(void *ctx, const uint8_t *wire_payload, uint16_t len) {
+     emit_ctx_t *e = (emit_ctx_t *)ctx;
+     encrypt_and_emit(e->conn, WN_PKT_DATA, wire_payload, len, /*is_retransmit*/ false, e->cb);
+@@ -669,6 +780,13 @@
+ wn_result_t wn_connection_on_packet(wn_connection_t *conn, uint8_t type,
+                                      const uint8_t *enc_body, size_t enc_body_len,
+                                      uint64_t now_ms, const wn_conn_callbacks_t *cb) {
++    return wn_connection_on_packet_from(conn, type, enc_body, enc_body_len, now_ms, cb, NULL, 0);
++}
++
++wn_result_t wn_connection_on_packet_from(wn_connection_t *conn, uint8_t type,
++                                         const uint8_t *enc_body, size_t enc_body_len,
++                                         uint64_t now_ms, const wn_conn_callbacks_t *cb,
++                                         const struct sockaddr_storage *from, socklen_t from_len) {
+     if (enc_body_len < 8 + 8 + WN_GCM_TAG_SIZE) return WN_ERR_PROTOCOL_MISMATCH;
+ 
+     uint64_t counter = wn_get_u64(enc_body + 8);
+@@ -721,6 +839,16 @@
+     conn->stats.packets_received++;
+     conn->stats.bytes_received += enc_body_len + 1; /* +1 for the type byte, passed separately */
+ 
++    if (type == WN_PKT_PATH_CHALLENGE || type == WN_PKT_PATH_RESPONSE) {
++        bool ok = from && (conn->capabilities & WN_CAP_MIGRATION) && ct_len == WN_PATH_TOKEN_SIZE;
++        if (ok) path_handle_probe(conn, type, plaintext, from, from_len, cb);
++        pthread_mutex_unlock(&conn->lock);
++        return ok ? WN_OK : WN_ERR_PROTOCOL_MISMATCH;
++    }
++    if (from && (conn->capabilities & WN_CAP_MIGRATION)) {
++        path_observe_authenticated(conn, from, from_len, (size_t)enc_body_len + 1, now_ms, cb);
++    }
++
+     wn_result_t result = WN_OK;
+     bool just_confirmed = false;
+     bool became_disconnected = false;
+@@ -909,6 +1037,7 @@
+         pthread_mutex_unlock(&conn->lock);
+         return;
+     }
++    path_tick(conn, now_ms, cb);
+ 
+     /* Idle timeout. */
+     if (now_ms - conn->last_recv_time_ms > conn->connection_timeout_ms) {
+diff -ruN -x build -x __pycache__ weft/weft-net-main/src/connection.h mig/src/connection.h
+--- a/src/connection.h	2026-11-26 10:39:28.000000000 +0000
++++ b/src/connection.h	2026-11-28 10:06:25.509728267 +0000
+@@ -93,6 +93,11 @@
+                                           wn_delivery_t delivery, const uint8_t *data, uint32_t len);
+ typedef void (*wn_conn_disconnected_fn)(void *ctx, wn_peer_id_t peer, wn_result_t reason);
+ typedef void (*wn_conn_send_wire_fn)(void *ctx, wn_peer_id_t peer, const uint8_t *packet, size_t len);
++/* Like send_wire, but to an explicit address instead of the connection's
++ * current one. Used for path challenges and responses during migration. */
++typedef void (*wn_conn_send_wire_to_fn)(void *ctx, wn_peer_id_t peer,
++                                        const struct sockaddr_storage *addr, socklen_t addr_len,
++                                        const uint8_t *packet, size_t len);
+ /* Client-side only: fired exactly once, the first time the handshake is
+  * confirmed end-to-end (this connection successfully decrypted a
+  * CONNECT_ACCEPTED). Until this fires, the client shouldn't consider
+@@ -105,6 +110,7 @@
+     wn_conn_deliver_event_fn on_data;
+     wn_conn_disconnected_fn  on_disconnected;
+     wn_conn_send_wire_fn     send_wire; /* actually put bytes on the socket */
++    wn_conn_send_wire_to_fn  send_wire_to; /* as send_wire, to a given address; may be NULL (migration off) */
+ 
+     wn_conn_accept_fn        can_accept;
+     wn_conn_connected_fn     on_connected; /* may be NULL (server side doesn't need it) */
+@@ -197,6 +203,19 @@
+     /* Negotiated handshake capabilities (AND of both peers' advertised sets). */
+     uint32_t capabilities;
+ 
++    /* Connection migration (WN_CAP_MIGRATION). An authenticated packet from
++     * a new address starts a path check: a PATH_CHALLENGE goes to that
++     * address, and sends move there only after a matching PATH_RESPONSE.
++     * Until then, bytes sent to it are capped at 3x the bytes received. */
++    bool                    path_pending;
++    struct sockaddr_storage path_addr;
++    socklen_t               path_addr_len;
++    uint8_t                 path_token[8];
++    uint64_t                path_started_ms;
++    uint64_t                path_next_challenge_ms;
++    uint64_t                path_bytes_sent;
++    uint64_t                path_bytes_received;
++
+     bool handshake_confirmed; /* client-side: has CONNECT_ACCEPTED been seen yet */
+     /* Server-side: CONNECT_ACCEPTED retransmission bookkeeping. The client
+      * may silently drop the single ACCEPTED datagram; until it confirms by
+@@ -236,6 +255,14 @@
+  * invoke cb->on_disconnected if the connection has timed out. Thread-safe. */
+ void wn_connection_tick(wn_connection_t *conn, uint64_t now_ms, const wn_conn_callbacks_t *cb);
+ 
++/* As wn_connection_on_packet, but also passes the datagram's source address,
++ * which enables connection migration. `from` may be NULL (for example for
++ * WebSocket-carried packets), which disables migration for that packet. */
++wn_result_t wn_connection_on_packet_from(wn_connection_t *conn, uint8_t type,
++                                         const uint8_t *enc_body, size_t enc_body_len,
++                                         uint64_t now_ms, const wn_conn_callbacks_t *cb,
++                                         const struct sockaddr_storage *from, socklen_t from_len);
++
+ /* Flush any lanes with a pending receive ack (ack_dirty) as standalone
+  * WN_PKT_ACK packets. Called by the endpoint after draining the socket
+  * (so acks for received DATA go out promptly even when the application
+diff -ruN -x build -x __pycache__ weft/weft-net-main/src/endpoint.c mig/src/endpoint.c
+--- a/src/endpoint.c	2026-11-26 10:39:28.000000000 +0000
++++ b/src/endpoint.c	2026-11-28 10:06:25.517482640 +0000
+@@ -806,6 +806,13 @@
+     ep_send_wn(c->ep, &c->conn->addr, c->conn->addr_len, packet, len);
+ }
+ 
++static void ep_send_wire_to(void *ctx, wn_peer_id_t peer, const struct sockaddr_storage *addr,
++                            socklen_t addr_len, const uint8_t *packet, size_t len) {
++    (void)peer;
++    conn_ctx_t *c = (conn_ctx_t *)ctx;
++    ep_send_wn(c->ep, addr, addr_len, packet, len);
++}
++
+ static bool ep_on_data(void *ctx, wn_peer_id_t peer, uint8_t channel, wn_delivery_t delivery,
+                         const uint8_t *data, uint32_t len) {
+     (void)delivery;
+@@ -879,6 +886,7 @@
+     cb.can_accept = ep_can_accept;
+     cb.on_disconnected = ep_on_disconnected;
+     cb.send_wire = ep_send_wire;
++    cb.send_wire_to = ep_send_wire_to;
+     cb.on_connected = ep_on_connected;
+     cb.ctx = cctx;
+     return cb;
+@@ -1617,7 +1625,8 @@
+ /* ---- main packet dispatch ---- */
+ 
+ static void process_main_packet(wn_endpoint_t *ep, const uint8_t *buf, size_t len,
+-                                 const struct sockaddr_storage *from, socklen_t from_len, uint64_t now) {
++                                 const struct sockaddr_storage *from, socklen_t from_len, uint64_t now,
++                                 bool udp) {
+     if (len < 1) return;
+     uint8_t type = buf[0];
+     switch (type) {
+@@ -1637,6 +1646,8 @@
+         case WN_PKT_ACK:
+         case WN_PKT_KEEPALIVE:
+         case WN_PKT_DISCONNECT:
++        case WN_PKT_PATH_CHALLENGE:
++        case WN_PKT_PATH_RESPONSE:
+         case WN_PKT_CONNECT_ACCEPTED: {
+             if (len < 1 + 8) return;
+             uint64_t connid = wn_get_u64(buf + 1);
+@@ -1645,7 +1656,9 @@
+             if (conn) {
+                 conn_ctx_t cctx = { ep, conn };
+                 wn_conn_callbacks_t cb = make_callbacks(&cctx);
+-                wn_connection_on_packet(conn, type, buf + 1, len - 1, now, &cb);
++                /* Only UDP datagrams carry a source address that migration can use. */
++                wn_connection_on_packet_from(conn, type, buf + 1, len - 1, now, &cb,
++                                             udp ? from : NULL, from_len);
+             }
+             pthread_mutex_unlock(&ep->connections_lock);
+             break;
+@@ -1722,7 +1735,7 @@
+         return false;
+     }
+     if (opcode != WN_WS_OPCODE_BINARY && opcode != WN_WS_OPCODE_TEXT) return false;
+-    process_main_packet(ep, msg, len, &link->addr, link->addr_len, now);
++    process_main_packet(ep, msg, len, &link->addr, link->addr_len, now, false);
+     return true;
+ }
+ 
+@@ -1974,7 +1987,7 @@
+                     memset(&from, 0, sizeof(from));
+                     ssize_t n = recvfrom(ep->sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &from_len);
+                     if (n <= 0) break;
+-                    process_main_packet(ep, buf, (size_t)n, &from, from_len, now);
++                    process_main_packet(ep, buf, (size_t)n, &from, from_len, now, true);
+                     got_packets = true;
+                 }
+             }
+diff -ruN -x build -x __pycache__ weft/weft-net-main/src/protocol.h mig/src/protocol.h
+--- a/src/protocol.h	2026-11-26 10:39:28.000000000 +0000
++++ b/src/protocol.h	2026-11-28 10:06:25.507795239 +0000
+@@ -40,6 +40,8 @@
+     WN_PKT_ACK               = 0x09, /* encrypted */
+     WN_PKT_DISCOVERY_REQUEST = 0x0A,
+     WN_PKT_DISCOVERY_RESPONSE= 0x0B,
++    WN_PKT_PATH_CHALLENGE    = 0x0C, /* encrypted: 8-byte token; connection migration */
++    WN_PKT_PATH_RESPONSE     = 0x0D, /* encrypted: echoes the challenge token */
+ } wn_packet_type_t;
+ 
+ /* ---- Handshake packets (cleartext; authenticity comes from the cookie
+diff -ruN -x build -x __pycache__ weft/weft-net-main/tests/integration/test_migration_integration.c mig/tests/integration/test_migration_integration.c
+--- a/tests/integration/test_migration_integration.c	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/integration/test_migration_integration.c	2026-11-28 10:08:55.983304585 +0000
+@@ -0,0 +1,193 @@
++/* Connection migration over real UDP sockets.
++ *
++ * The client talks to a relay on loopback, and the relay talks to the
++ * server. Partway through the session the relay closes its upstream socket
++ * and opens a new one on a different port, the way a NAT rebinding does. The
++ * server then sees the client at a new source address. Packets still sent to
++ * the old port are lost, as they would be on a real network. */
++#include "../test_framework.h"
++#include "../../include/weft_net.h"
++#include <string.h>
++#include <stdlib.h>
++#include <stdio.h>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdatomic.h>
++
++typedef struct {
++    int front;                 /* client talks to this socket */
++    int up;                    /* socket toward the server; replaced on rebind */
++    struct sockaddr_in server;
++    struct sockaddr_in client; /* learned from the client's first packet */
++    bool have_client;
++    uint16_t front_port;
++    uint16_t up_port;
++    atomic_int rebind_req;
++    atomic_int rebound;
++    atomic_int stop;
++} relay_t;
++
++static int open_loopback_udp(uint16_t *out_port) {
++    int fd = socket(AF_INET, SOCK_DGRAM, 0);
++    if (fd < 0) return -1;
++    struct sockaddr_in a;
++    memset(&a, 0, sizeof(a));
++    a.sin_family = AF_INET;
++    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    a.sin_port = 0;
++    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) { close(fd); return -1; }
++    socklen_t len = sizeof(a);
++    getsockname(fd, (struct sockaddr *)&a, &len);
++    *out_port = ntohs(a.sin_port);
++    return fd;
++}
++
++static void *relay_thread(void *arg) {
++    relay_t *r = (relay_t *)arg;
++    uint8_t buf[2048];
++    while (!atomic_load(&r->stop)) {
++        if (atomic_exchange(&r->rebind_req, 0)) {
++            close(r->up);
++            r->up = open_loopback_udp(&r->up_port);
++            atomic_store(&r->rebound, 1);
++        }
++        struct pollfd fds[2];
++        fds[0].fd = r->front; fds[0].events = POLLIN; fds[0].revents = 0;
++        fds[1].fd = r->up;    fds[1].events = POLLIN; fds[1].revents = 0;
++        if (poll(fds, 2, 10) <= 0) continue;
++
++        if (fds[0].revents & POLLIN) {
++            struct sockaddr_in from;
++            socklen_t flen = sizeof(from);
++            ssize_t n = recvfrom(r->front, buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
++            if (n > 0) {
++                r->client = from;
++                r->have_client = true;
++                sendto(r->up, buf, (size_t)n, 0, (struct sockaddr *)&r->server, sizeof(r->server));
++            }
++        }
++        if (fds[1].revents & POLLIN) {
++            struct sockaddr_in from;
++            socklen_t flen = sizeof(from);
++            ssize_t n = recvfrom(r->up, buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
++            if (n > 0 && r->have_client) {
++                sendto(r->front, buf, (size_t)n, 0, (struct sockaddr *)&r->client, sizeof(r->client));
++            }
++        }
++    }
++    return NULL;
++}
++
++static bool relay_start(relay_t *r, uint16_t server_port, pthread_t *tid) {
++    memset(r, 0, sizeof(*r));
++    r->front = open_loopback_udp(&r->front_port);
++    r->up = open_loopback_udp(&r->up_port);
++    if (r->front < 0 || r->up < 0) return false;
++    r->server.sin_family = AF_INET;
++    r->server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    r->server.sin_port = htons(server_port);
++    return pthread_create(tid, NULL, relay_thread, r) == 0;
++}
++
++static void relay_stop(relay_t *r, pthread_t tid) {
++    atomic_store(&r->stop, 1);
++    pthread_join(tid, NULL);
++    close(r->front);
++    close(r->up);
++}
++
++static wn_address_t make_addr(const char *host, uint16_t port) {
++    wn_address_t a;
++    memset(&a, 0, sizeof(a));
++    strncpy(a.host, host, sizeof(a.host) - 1);
++    a.port = port;
++    a.family = WN_AF_UNSPEC;
++    return a;
++}
++
++static bool wait_for_event(wn_endpoint_t *ep, wn_event_type_t type, wn_event_t *out, int timeout_ms) {
++    uint64_t iterations = (uint64_t)timeout_ms / 50 + 1;
++    for (uint64_t i = 0; i < iterations; i++) {
++        if (wn_poll_event(ep, out, 50) && out->event_type == type) return true;
++    }
++    return false;
++}
++
++/* Connect a client through a relay, rebind the relay, and check whether the
++ * server's reply still reaches the client. Returns true if it did. */
++static bool run_rebind_scenario(uint16_t server_port, bool server_migrates) {
++    wn_config_t server_cfg, client_cfg;
++    wn_config_default(&server_cfg);
++    wn_config_default(&client_cfg);
++    if (!server_migrates) server_cfg.capabilities &= ~WN_CAP_MIGRATION;
++
++    wn_endpoint_t *server = NULL, *client = NULL;
++    wn_address_t bind_addr = make_addr("127.0.0.1", server_port);
++    ASSERT_EQ(wn_server_create(&bind_addr, &server_cfg, &server), WN_OK);
++
++    relay_t relay;
++    pthread_t tid;
++    ASSERT_TRUE(relay_start(&relay, server_port, &tid));
++
++    ASSERT_EQ(wn_client_create(&client_cfg, &client), WN_OK);
++    wn_address_t relay_addr = make_addr("127.0.0.1", relay.front_port);
++    wn_peer_id_t client_peer;
++    ASSERT_EQ(wn_connect(client, &relay_addr, &client_peer), WN_OK);
++
++    wn_event_t ev;
++    ASSERT_TRUE(wait_for_event(client, WN_EVENT_CONNECTED, &ev, 3000));
++    ASSERT_TRUE(wait_for_event(server, WN_EVENT_CONNECTED, &ev, 3000));
++    wn_peer_id_t server_peer = ev.peer;
++
++    const char *before = "before rebind";
++    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
++                      (const uint8_t *)before, strlen(before)), WN_OK);
++    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
++    ASSERT_MEM_EQ(ev.data, before, strlen(before));
++
++    /* Rebind: the server now sees the client from a new port. */
++    atomic_store(&relay.rebind_req, 1);
++    for (int i = 0; i < 300 && !atomic_load(&relay.rebound); i++) usleep(10000);
++    ASSERT_TRUE(atomic_load(&relay.rebound));
++
++    const char *after = "after rebind";
++    ASSERT_EQ(wn_send(client, client_peer, 0, WN_RELIABLE_ORDERED,
++                      (const uint8_t *)after, strlen(after)), WN_OK);
++    ASSERT_TRUE(wait_for_event(server, WN_EVENT_DATA, &ev, 3000));
++    ASSERT_MEM_EQ(ev.data, after, strlen(after));
++
++    /* Server-to-client traffic. With migration it must reach the client on
++     * the new port; without it, it keeps going to the lost old port. */
++    const char *reply = "reply after rebind";
++    ASSERT_EQ(wn_send(server, server_peer, 0, WN_RELIABLE_ORDERED,
++                      (const uint8_t *)reply, strlen(reply)), WN_OK);
++    bool got_reply = wait_for_event(client, WN_EVENT_DATA, &ev, 3000);
++    if (got_reply) ASSERT_MEM_EQ(ev.data, reply, strlen(reply));
++
++    relay_stop(&relay, tid);
++    wn_endpoint_destroy(client);
++    wn_endpoint_destroy(server);
++    return got_reply;
++}
++
++TEST(test_server_reply_reaches_rebound_client_when_migration_on) {
++    ASSERT_TRUE(run_rebind_scenario(34761, true));
++}
++
++TEST(test_server_reply_lost_after_rebind_when_migration_off) {
++    /* Opt-out check: with migration disabled on the server, the connection
++     * keeps sending to the old address, so the reply never arrives. */
++    ASSERT_FALSE(run_rebind_scenario(34762, false));
++}
++
++int main(void) {
++    printf("=== migration integration tests ===\n");
++    RUN_TEST(test_server_reply_reaches_rebound_client_when_migration_on);
++    RUN_TEST(test_server_reply_lost_after_rebind_when_migration_off);
++    TEST_SUMMARY();
++    return 0;
++}
+diff -ruN -x build -x __pycache__ weft/weft-net-main/tests/test_migration.c mig/tests/test_migration.c
+--- a/tests/test_migration.c	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_migration.c	2026-11-28 10:04:51.301476117 +0000
+@@ -0,0 +1,400 @@
++#include "test_framework.h"
++#include "../src/connection.h"
++#include "../src/protocol.h"
++#include "../src/byteorder.h"
++#include <string.h>
++#include <stdlib.h>
++#include <arpa/inet.h>
++
++/* Connection migration tests. Each side has an outbox instead of a socket:
++ * sends are queued with their destination address, and a test delivers them
++ * explicitly. A packet is only delivered when its destination equals the
++ * receiving side's current address, so a packet sent to an old address after
++ * the peer has moved is lost, the same as on a real network. The source
++ * address passed to the receiver is the sender's address at delivery time. */
++
++#define MAX_OUT 64
++#define MAX_PKT 2048
++
++typedef struct {
++    uint8_t           pkt[MAX_PKT];
++    size_t            len;
++    struct sockaddr_storage dest;
++    socklen_t         dest_len;
++} outmsg_t;
++
++typedef struct side {
++    wn_connection_t  *conn;
++    struct sockaddr_storage own; /* address this side currently sends from */
++    socklen_t         own_len;
++    outmsg_t          out[MAX_OUT];
++    int               out_count;
++    int               out_overflow;
++    int               data_count;
++    uint8_t           last_data[64];
++    uint32_t          last_data_len;
++    wn_conn_callbacks_t cb;
++} side_t;
++
++typedef struct {
++    side_t client;
++    side_t server;
++    uint64_t now;
++} pair_t;
++
++static void addr4(struct sockaddr_storage *s, socklen_t *len, uint16_t port) {
++    memset(s, 0, sizeof(*s));
++    struct sockaddr_in *a = (struct sockaddr_in *)s;
++    a->sin_family = AF_INET;
++    a->sin_port = htons(port);
++    a->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++    *len = sizeof(*a);
++}
++
++static bool addr_is(const struct sockaddr_storage *s, uint16_t port) {
++    const struct sockaddr_in *a = (const struct sockaddr_in *)s;
++    return a->sin_family == AF_INET && ntohs(a->sin_port) == port;
++}
++
++/* Callbacks run with the connection lock held, so they must not assert. */
++static void queue_out(side_t *s, const uint8_t *packet, size_t len,
++                      const struct sockaddr_storage *dest, socklen_t dest_len) {
++    if (s->out_count >= MAX_OUT || len > MAX_PKT) {
++        s->out_overflow++;
++        return;
++    }
++    outmsg_t *m = &s->out[s->out_count++];
++    memcpy(m->pkt, packet, len);
++    m->len = len;
++    memcpy(&m->dest, dest, dest_len);
++    m->dest_len = dest_len;
++}
++
++static void cb_send_wire(void *ctx, wn_peer_id_t peer, const uint8_t *packet, size_t len) {
++    (void)peer;
++    side_t *s = (side_t *)ctx;
++    queue_out(s, packet, len, &s->conn->addr, s->conn->addr_len);
++}
++
++static void cb_send_wire_to(void *ctx, wn_peer_id_t peer, const struct sockaddr_storage *addr,
++                            socklen_t addr_len, const uint8_t *packet, size_t len) {
++    (void)peer;
++    side_t *s = (side_t *)ctx;
++    queue_out(s, packet, len, addr, addr_len);
++}
++
++static bool cb_on_data(void *ctx, wn_peer_id_t peer, uint8_t channel, wn_delivery_t delivery,
++                       const uint8_t *data, uint32_t len) {
++    (void)peer; (void)channel; (void)delivery;
++    side_t *s = (side_t *)ctx;
++    s->data_count++;
++    s->last_data_len = len < sizeof(s->last_data) ? len : (uint32_t)sizeof(s->last_data);
++    memcpy(s->last_data, data, s->last_data_len);
++    return true;
++}
++
++static void cb_on_disconnected(void *ctx, wn_peer_id_t peer, wn_result_t reason) {
++    (void)ctx; (void)peer; (void)reason;
++}
++
++static bool cb_can_accept(void *ctx, uint32_t len) {
++    (void)ctx; (void)len;
++    return true;
++}
++
++static void side_init(side_t *s, wn_connection_t *conn, uint16_t port) {
++    memset(s, 0, sizeof(*s));
++    s->conn = conn;
++    addr4(&s->own, &s->own_len, port);
++    s->cb.on_data = cb_on_data;
++    s->cb.on_disconnected = cb_on_disconnected;
++    s->cb.send_wire = cb_send_wire;
++    s->cb.send_wire_to = cb_send_wire_to;
++    s->cb.can_accept = cb_can_accept;
++    s->cb.on_connected = NULL;
++    s->cb.ctx = s;
++}
++
++/* Client at 127.0.0.1:5001, server at 127.0.0.1:6000, both with migration
++ * negotiated (the handshake sets this bit in production, so tests set it
++ * directly). */
++static void pair_init(pair_t *p) {
++    memset(p, 0, sizeof(*p));
++    uint8_t c2s_key[32], s2c_key[32];
++    uint8_t c2s_salt[12] = {1}, s2c_salt[12] = {2};
++    for (int i = 0; i < 32; i++) {
++        c2s_key[i] = (uint8_t)(i + 1);
++        s2c_key[i] = (uint8_t)(0xA0 + i);
++    }
++
++    struct sockaddr_storage a_client, a_server;
++    socklen_t l_client, l_server;
++    addr4(&a_client, &l_client, 5001);
++    addr4(&a_server, &l_server, 6000);
++
++    wn_connection_t *cc = wn_connection_create(1001, &a_server, l_server, true, 4,
++                                               c2s_key, s2c_key, c2s_salt, s2c_salt,
++                                               10000, 1000, 0);
++    wn_connection_t *sc = wn_connection_create(1001, &a_client, l_client, false, 4,
++                                               s2c_key, c2s_key, s2c_salt, c2s_salt,
++                                               10000, 1000, 0);
++    ASSERT_TRUE(cc != NULL);
++    ASSERT_TRUE(sc != NULL);
++    cc->capabilities = WN_CAP_DEFAULT;
++    sc->capabilities = WN_CAP_DEFAULT;
++
++    side_init(&p->client, cc, 5001);
++    side_init(&p->server, sc, 6000);
++    p->now = 1000;
++}
++
++static void pair_free(pair_t *p) {
++    wn_connection_destroy(p->client.conn);
++    wn_connection_destroy(p->server.conn);
++}
++
++/* Deliver one queued packet to `to` if it was addressed to `to`'s current
++ * address. The source address is the sender's own address right now. */
++static bool deliver_one(side_t *from, int idx, side_t *to, uint64_t now) {
++    outmsg_t *m = &from->out[idx];
++    if (m->dest_len != to->own_len || memcmp(&m->dest, &to->own, to->own_len) != 0) {
++        return false;
++    }
++    wn_connection_on_packet_from(to->conn, m->pkt[0], m->pkt + 1, m->len - 1, now, &to->cb,
++                                 &from->own, from->own_len);
++    return true;
++}
++
++/* Deliver everything `from` queued to `to`, then clear the outbox. */
++static int pump(side_t *from, side_t *to, uint64_t now) {
++    int delivered = 0;
++    int n = from->out_count;
++    for (int i = 0; i < n; i++) {
++        if (deliver_one(from, i, to, now)) delivered++;
++    }
++    from->out_count = 0;
++    return delivered;
++}
++
++/* Deliver in both directions until nothing more moves. */
++static void settle(pair_t *p) {
++    for (int i = 0; i < 20; i++) {
++        int a = pump(&p->client, &p->server, p->now);
++        int b = pump(&p->server, &p->client, p->now);
++        if (a == 0 && b == 0) break;
++    }
++}
++
++/* Index of the first queued packet of `type` addressed to `port`, or -1. */
++static int find_out(side_t *s, uint8_t type, uint16_t port) {
++    for (int i = 0; i < s->out_count; i++) {
++        if (s->out[i].pkt[0] == type && addr_is(&s->out[i].dest, port)) return i;
++    }
++    return -1;
++}
++
++static void send_data(pair_t *p, side_t *from, const char *text) {
++    wn_result_t r = wn_connection_send(from->conn, 0, WN_RELIABLE_ORDERED,
++                                       (const uint8_t *)text, strlen(text), 0, p->now,
++                                       &from->cb);
++    ASSERT_EQ(r, WN_OK);
++}
++
++/* Client sends one message from its original address, then moves to port
++ * 5002 (a NAT rebinding, for example) and sends again. The server sees an
++ * authenticated packet from the new address. */
++static void client_moves_and_sends(pair_t *p) {
++    send_data(p, &p->client, "before move");
++    settle(p);
++    addr4(&p->client.own, &p->client.own_len, 5002);
++    send_data(p, &p->client, "after move");
++    pump(&p->client, &p->server, p->now);
++}
++
++TEST(test_migration_capability_is_on_by_default) {
++    ASSERT_EQ(WN_CAP_MIGRATION, 0x00000008u);
++    ASSERT_TRUE((WN_CAP_DEFAULT & WN_CAP_MIGRATION) != 0);
++}
++
++TEST(test_authentic_packet_from_new_address_is_delivered_and_challenged) {
++    pair_t p;
++    pair_init(&p);
++
++    client_moves_and_sends(&p);
++
++    /* The authenticated data is still delivered. */
++    ASSERT_EQ(p.server.data_count, 2);
++    /* Sends are not redirected until the new address proves it can receive. */
++    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
++    ASSERT_TRUE(p.server.conn->path_pending);
++    ASSERT_TRUE(addr_is(&p.server.conn->path_addr, 5002));
++    /* The challenge goes to the new address. */
++    ASSERT_TRUE(find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002) >= 0);
++    pair_free(&p);
++}
++
++TEST(test_path_response_moves_connection_and_later_sends_follow) {
++    pair_t p;
++    pair_init(&p);
++
++    client_moves_and_sends(&p);
++    settle(&p);
++
++    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5002));
++    ASSERT_FALSE(p.server.conn->path_pending);
++
++    /* Server-to-client data now goes to the new address and arrives there. */
++    send_data(&p, &p.server, "reply on new path");
++    settle(&p);
++    ASSERT_EQ(p.client.data_count, 1);
++    ASSERT_MEM_EQ(p.client.last_data, "reply on new path", p.client.last_data_len);
++    pair_free(&p);
++}
++
++TEST(test_data_keeps_going_to_old_address_during_validation) {
++    pair_t p;
++    pair_init(&p);
++
++    client_moves_and_sends(&p);
++    /* Server still has an unvalidated new path. Its data must go to the old
++     * address, not the one that has not yet been validated. */
++    send_data(&p, &p.server, "mid validation");
++    ASSERT_TRUE(find_out(&p.server, WN_PKT_DATA, 5001) >= 0);
++    ASSERT_TRUE(find_out(&p.server, WN_PKT_DATA, 5002) < 0);
++    pair_free(&p);
++}
++
++TEST(test_path_response_with_wrong_token_is_ignored) {
++    pair_t p;
++    pair_init(&p);
++
++    client_moves_and_sends(&p);
++    /* Corrupt the server's stored token so the client's (authentic) response
++     * no longer matches. */
++    p.server.conn->path_token[0] ^= 0x01;
++    settle(&p);
++
++    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
++    ASSERT_TRUE(p.server.conn->path_pending);
++    pair_free(&p);
++}
++
++TEST(test_path_response_from_unexpected_address_is_ignored) {
++    pair_t p;
++    pair_init(&p);
++
++    client_moves_and_sends(&p);
++    /* The server sends its challenge to 5002. Deliver it, then move the
++     * client to 5003 before its response goes out. The response comes from
++     * an address the server never challenged. */
++    pump(&p.server, &p.client, p.now);
++    addr4(&p.client.own, &p.client.own_len, 5003);
++    pump(&p.client, &p.server, p.now);
++
++    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
++    ASSERT_TRUE(p.server.conn->path_pending);
++    ASSERT_TRUE(addr_is(&p.server.conn->path_addr, 5002));
++    pair_free(&p);
++}
++
++TEST(test_unauthenticated_packet_from_new_address_triggers_nothing) {
++    pair_t p;
++    pair_init(&p);
++
++    send_data(&p, &p.client, "tampered");
++    ASSERT_EQ(p.client.out_count, 1);
++    /* Flip one bit of the GCM tag so the packet fails authentication. */
++    p.client.out[0].pkt[p.client.out[0].len - 1] ^= 0x01;
++    addr4(&p.client.own, &p.client.own_len, 5002);
++    pump(&p.client, &p.server, p.now);
++
++    ASSERT_EQ(p.server.data_count, 0);
++    ASSERT_FALSE(p.server.conn->path_pending);
++    ASSERT_TRUE(find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002) < 0);
++    pair_free(&p);
++}
++
++TEST(test_migration_disabled_when_capability_not_negotiated) {
++    pair_t p;
++    pair_init(&p);
++    p.server.conn->capabilities &= ~WN_CAP_MIGRATION;
++
++    client_moves_and_sends(&p);
++    settle(&p);
++
++    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
++    ASSERT_FALSE(p.server.conn->path_pending);
++    ASSERT_TRUE(find_out(&p.server, WN_PKT_PATH_CHALLENGE, 5002) < 0);
++    pair_free(&p);
++}
++
++TEST(test_amplification_budget_limits_bytes_to_unvalidated_address) {
++    pair_t p;
++    pair_init(&p);
++
++    client_moves_and_sends(&p);
++    uint32_t trigger_bytes = p.server.conn->path_bytes_received;
++    ASSERT_TRUE(trigger_bytes > 0);
++
++    /* The client never answers. Keep ticking the server for longer than the
++     * retransmit interval, discarding everything it sends. */
++    for (int i = 0; i < 40; i++) {
++        p.now += 100;
++        wn_connection_tick(p.server.conn, p.now, &p.server.cb);
++        p.server.out_count = 0;
++    }
++
++    ASSERT_TRUE(p.server.conn->path_bytes_sent <= 3 * p.server.conn->path_bytes_received);
++    ASSERT_TRUE(p.server.conn->path_bytes_sent > 0);
++    pair_free(&p);
++}
++
++TEST(test_unanswered_challenge_is_abandoned_after_timeout) {
++    pair_t p;
++    pair_init(&p);
++
++    client_moves_and_sends(&p);
++    for (int i = 0; i < 80; i++) {
++        p.now += 100;
++        wn_connection_tick(p.server.conn, p.now, &p.server.cb);
++        p.server.out_count = 0;
++    }
++
++    ASSERT_FALSE(p.server.conn->path_pending);
++    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
++    pair_free(&p);
++}
++
++TEST(test_reliable_messages_arrive_in_order_across_migration) {
++    pair_t p;
++    pair_init(&p);
++
++    send_data(&p, &p.client, "one");
++    settle(&p);
++    addr4(&p.client.own, &p.client.own_len, 5002);
++    send_data(&p, &p.client, "two");
++    send_data(&p, &p.client, "three");
++    settle(&p);
++
++    ASSERT_EQ(p.server.data_count, 3);
++    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5002));
++    ASSERT_MEM_EQ(p.server.last_data, "three", p.server.last_data_len);
++    pair_free(&p);
++}
++
++int main(void) {
++    printf("=== migration tests ===\n");
++    RUN_TEST(test_migration_capability_is_on_by_default);
++    RUN_TEST(test_authentic_packet_from_new_address_is_delivered_and_challenged);
++    RUN_TEST(test_path_response_moves_connection_and_later_sends_follow);
++    RUN_TEST(test_data_keeps_going_to_old_address_during_validation);
++    RUN_TEST(test_path_response_with_wrong_token_is_ignored);
++    RUN_TEST(test_path_response_from_unexpected_address_is_ignored);
++    RUN_TEST(test_unauthenticated_packet_from_new_address_triggers_nothing);
++    RUN_TEST(test_migration_disabled_when_capability_not_negotiated);
++    RUN_TEST(test_amplification_budget_limits_bytes_to_unvalidated_address);
++    RUN_TEST(test_unanswered_challenge_is_abandoned_after_timeout);
++    RUN_TEST(test_reliable_messages_arrive_in_order_across_migration);
++    TEST_SUMMARY();
++    return 0;
++}

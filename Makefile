@@ -112,6 +112,7 @@ test-unit: | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_network_simulation src/channel.c src/seqbuf.c src/fragment.c tests/test_network_simulation.c
 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_websocket src/websocket.c src/crypto.c tests/test_websocket.c $(CRYPTO_LIBS)
 	$(CC) $(TEST_CFLAGS) -o $(TEST_BIN_DIR)/test_framework tests/test_framework.c
+	$(CC) $(TEST_CFLAGS) -pthread -o $(TEST_BIN_DIR)/test_migration src/connection.c src/channel.c src/seqbuf.c src/fragment.c src/crypto.c tests/test_migration.c $(CRYPTO_LIBS)
 	@echo "--- running unit tests ---"
 	$(TEST_BIN_DIR)/test_seqbuf
 	$(TEST_BIN_DIR)/test_crypto
@@ -121,6 +122,7 @@ test-unit: | $(BUILD_DIR)
 	$(TEST_BIN_DIR)/test_network_simulation
 	$(TEST_BIN_DIR)/test_websocket
 	$(TEST_BIN_DIR)/test_framework
+	$(TEST_BIN_DIR)/test_migration
 
 test-integration: | $(BUILD_DIR)
 	mkdir -p $(TEST_BIN_DIR)
@@ -128,10 +130,13 @@ test-integration: | $(BUILD_DIR)
 		$(SRC) tests/integration/test_integration.c $(CRYPTO_LIBS)
 	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -pthread -o $(TEST_BIN_DIR)/test_websocket_integration \
 		$(SRC) tests/integration/test_websocket_integration.c $(CRYPTO_LIBS)
+	$(CC) $(TEST_CFLAGS) -D_GNU_SOURCE -pthread -o $(TEST_BIN_DIR)/test_migration_integration \
+		$(SRC) tests/integration/test_migration_integration.c $(CRYPTO_LIBS)
 	@echo "--- running integration tests (real sockets) ---"
 	$(TEST_BIN_DIR)/test_integration
 	@echo "--- running integration tests (websocket transport) ---"
 	$(TEST_BIN_DIR)/test_websocket_integration
+	$(TEST_BIN_DIR)/test_migration_integration
 
 # --- concurrency tests ---
 #

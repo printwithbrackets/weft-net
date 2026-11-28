@@ -55,6 +55,7 @@ class Priority:
 CapFlowControl = 0x00000001
 CapPriority = 0x00000002
 CapRateLimit = 0x00000004
+CapMigration = 0x00000008
 
 # --------------------------------------------------------------------------
 # Library loading

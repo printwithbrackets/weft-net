@@ -65,6 +65,7 @@ const (
 	CapFlowControl uint32 = 0x00000001
 	CapPriority    uint32 = 0x00000002
 	CapRateLimit   uint32 = 0x00000004
+	CapMigration   uint32 = 0x00000008
 )
 
 // PeerStats mirrors wn_peer_stats_t.
