@@ -211,6 +211,18 @@ static void client_moves_and_sends(pair_t *p) {
     pump(&p->client, &p->server, p->now);
 }
 
+static void addr6_scoped(struct sockaddr_storage *s, socklen_t *len, uint16_t port, uint32_t scope) {
+    memset(s, 0, sizeof(*s));
+    struct sockaddr_in6 *a = (struct sockaddr_in6 *)s;
+    a->sin6_family = AF_INET6;
+    a->sin6_port = htons(port);
+    a->sin6_addr.s6_addr[0] = 0xfe;
+    a->sin6_addr.s6_addr[1] = 0x80;
+    a->sin6_addr.s6_addr[15] = 1;
+    a->sin6_scope_id = scope;
+    *len = sizeof(*a);
+}
+
 TEST(test_migration_capability_is_on_by_default) {
     ASSERT_EQ(WN_CAP_MIGRATION, 0x00000008u);
     ASSERT_TRUE((WN_CAP_DEFAULT & WN_CAP_MIGRATION) != 0);
@@ -512,6 +524,62 @@ TEST(test_reliable_messages_arrive_in_order_across_migration) {
     pair_free(&p);
 }
 
+/* Regression: the same link-local address on a different interface (scope)
+ * is a different path and must start validation. */
+TEST(test_same_address_different_ipv6_scope_starts_validation) {
+    pair_t p;
+    pair_init(&p);
+    addr6_scoped(&p.client.own, &p.client.own_len, 5001, 2);
+    p.server.conn->addr = p.client.own;
+    p.server.conn->addr_len = p.client.own_len;
+
+    send_data(&p, &p.client, "scope two");
+    pump(&p.client, &p.server, p.now);
+    ASSERT_FALSE(p.server.conn->path_pending);
+
+    addr6_scoped(&p.client.own, &p.client.own_len, 5001, 3);
+    send_data(&p, &p.client, "scope three");
+    pump(&p.client, &p.server, p.now);
+    ASSERT_TRUE(p.server.conn->path_pending);
+    pair_free(&p);
+}
+
+/* Regression: an authenticated challenge on a side without send_wire_to
+ * must not call a NULL function pointer. */
+TEST(test_challenge_without_send_wire_to_is_ignored) {
+    pair_t p;
+    pair_init(&p);
+    p.server.cb.send_wire_to = NULL;
+
+    p.client.conn->path_pending = true;
+    p.client.conn->path_addr = p.server.own;
+    p.client.conn->path_addr_len = p.server.own_len;
+    p.client.conn->path_started_ms = p.now;
+    p.client.conn->path_next_challenge_ms = 0;
+    p.client.conn->path_bytes_received = 1000;
+    wn_connection_tick(p.client.conn, p.now, &p.client.cb);
+    ASSERT_TRUE(find_out(&p.client, WN_PKT_PATH_CHALLENGE, 6000) >= 0);
+
+    pump(&p.client, &p.server, p.now);
+    ASSERT_EQ(find_out(&p.server, WN_PKT_PATH_RESPONSE, 5001), -1);
+    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
+    pair_free(&p);
+}
+
+/* Regression: a response arriving after the validation deadline must not
+ * commit the move, even if the periodic tick has not yet cleared the state. */
+TEST(test_response_after_validation_deadline_does_not_commit) {
+    pair_t p;
+    pair_init(&p);
+    client_moves_and_sends(&p);
+    pump(&p.server, &p.client, p.now); /* client receives the challenge and queues its response */
+    p.now += 5000;                     /* deadline is WN_PATH_TIMEOUT_MS, 5000 ms */
+    pump(&p.client, &p.server, p.now); /* the response arrives after the deadline */
+
+    ASSERT_TRUE(addr_is(&p.server.conn->addr, 5001));
+    pair_free(&p);
+}
+
 int main(void) {
     printf("=== migration tests ===\n");
     RUN_TEST(test_migration_capability_is_on_by_default);
@@ -529,6 +597,9 @@ int main(void) {
     RUN_TEST(test_amplification_budget_limits_bytes_to_unvalidated_address);
     RUN_TEST(test_response_arriving_after_validation_timeout_cannot_move_connection);
     RUN_TEST(test_reliable_messages_arrive_in_order_across_migration);
+    RUN_TEST(test_same_address_different_ipv6_scope_starts_validation);
+    RUN_TEST(test_challenge_without_send_wire_to_is_ignored);
+    RUN_TEST(test_response_after_validation_deadline_does_not_commit);
     TEST_SUMMARY();
     return 0;
 }

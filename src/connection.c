@@ -383,7 +383,8 @@ static bool path_same_addr(const struct sockaddr_storage *a, socklen_t a_len,
     if (a->ss_family == AF_INET6) {
         const struct sockaddr_in6 *x = (const struct sockaddr_in6 *)a;
         const struct sockaddr_in6 *y = (const struct sockaddr_in6 *)b;
-        return x->sin6_port == y->sin6_port && memcmp(&x->sin6_addr, &y->sin6_addr, 16) == 0;
+        return x->sin6_port == y->sin6_port && x->sin6_scope_id == y->sin6_scope_id &&
+               memcmp(&x->sin6_addr, &y->sin6_addr, 16) == 0;
     }
     return memcmp(a, b, a_len) == 0;
 }
@@ -391,6 +392,7 @@ static bool path_same_addr(const struct sockaddr_storage *a, socklen_t a_len,
 static void path_send_probe(wn_connection_t *conn, uint8_t type, const uint8_t *token,
                             const struct sockaddr_storage *dest, socklen_t dest_len,
                             const wn_conn_callbacks_t *cb) {
+    if (!cb->send_wire_to) return; /* migration is off for this side */
     encrypt_and_emit_to(conn, type, token, WN_PATH_TOKEN_SIZE, false, dest, dest_len, cb);
 }
 
@@ -433,12 +435,13 @@ static void path_observe_authenticated(wn_connection_t *conn, const struct socka
  * when it comes from the address being validated and echoes its token. */
 static void path_handle_probe(wn_connection_t *conn, uint8_t type, const uint8_t *token,
                               const struct sockaddr_storage *from, socklen_t from_len,
-                              const wn_conn_callbacks_t *cb) {
+                              uint64_t now_ms, const wn_conn_callbacks_t *cb) {
     if (type == WN_PKT_PATH_CHALLENGE) {
         path_send_probe(conn, WN_PKT_PATH_RESPONSE, token, from, from_len, cb);
         return;
     }
     if (!conn->path_pending) return;
+    if (now_ms - conn->path_started_ms >= WN_PATH_TIMEOUT_MS) return; /* expired; tick will clear it */
     if (!path_same_addr(from, from_len, &conn->path_addr, conn->path_addr_len)) return;
     if (!wn_crypto_const_time_eq(token, conn->path_token, WN_PATH_TOKEN_SIZE)) return;
     conn->addr = conn->path_addr;
@@ -841,7 +844,7 @@ wn_result_t wn_connection_on_packet_from(wn_connection_t *conn, uint8_t type,
 
     if (type == WN_PKT_PATH_CHALLENGE || type == WN_PKT_PATH_RESPONSE) {
         bool ok = from && (conn->capabilities & WN_CAP_MIGRATION) && ct_len == WN_PATH_TOKEN_SIZE;
-        if (ok) path_handle_probe(conn, type, plaintext, from, from_len, cb);
+        if (ok) path_handle_probe(conn, type, plaintext, from, from_len, now_ms, cb);
         pthread_mutex_unlock(&conn->lock);
         return ok ? WN_OK : WN_ERR_PROTOCOL_MISMATCH;
     }

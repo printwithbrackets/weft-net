@@ -51,9 +51,16 @@ static void *relay_thread(void *arg) {
     uint8_t buf[2048];
     while (!atomic_load(&r->stop)) {
         if (atomic_exchange(&r->rebind_req, 0)) {
-            close(r->up);
-            r->up = open_loopback_udp(&r->up_port);
-            atomic_store(&r->rebound, 1);
+            /* Bind the replacement while the old socket is still open, so the
+             * kernel cannot hand back the same port. */
+            uint16_t new_port = 0;
+            int fresh = open_loopback_udp(&new_port);
+            if (fresh >= 0) {
+                close(r->up);
+                r->up = fresh;
+                r->up_port = new_port;
+                atomic_store(&r->rebound, 1);
+            }
         }
         struct pollfd fds[2];
         fds[0].fd = r->front; fds[0].events = POLLIN; fds[0].revents = 0;
